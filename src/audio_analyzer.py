@@ -1,12 +1,13 @@
 """音訊分析模組 — 偵測匹克球擊球聲"""
 
-import subprocess
 import tempfile
 from pathlib import Path
 
 import librosa
 import numpy as np
 from scipy.signal import butter, filtfilt, find_peaks
+
+from .ffmpeg_utils import run_ffmpeg
 
 
 def extract_audio(video_path: str, output_path: str | None = None) -> str:
@@ -22,17 +23,16 @@ def extract_audio(video_path: str, output_path: str | None = None) -> str:
     if output_path is None:
         output_path = tempfile.mktemp(suffix=".wav")
 
-    cmd = [
-        "ffmpeg", "-i", video_path,
+    result = run_ffmpeg([
+        "-i", video_path,
         "-vn",                  # 不要影像
         "-acodec", "pcm_s16le", # 16-bit WAV
         "-ar", "22050",         # 取樣率 22050 Hz（夠用且省空間）
         "-ac", "1",             # 單聲道
         "-y",                   # 覆蓋已存在檔案
         output_path,
-    ]
+    ])
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"FFmpeg 抽取音軌失敗: {result.stderr}")
 
