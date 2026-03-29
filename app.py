@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
-from streamlit_drawable_canvas import st_canvas
+from streamlit_cropper import st_cropper
 
 from src.audio_analyzer import detect_hits, extract_audio
 from src.motion_detector import analyze_video_motion
@@ -74,27 +74,18 @@ def draw_timeline_chart(
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
 
-def extract_roi_from_canvas(canvas_result, scale: float) -> dict | None:
-    """從 drawable canvas 結果中取出 ROI 矩形座標。"""
-    if canvas_result is None or canvas_result.json_data is None:
-        return None
-
-    objects = canvas_result.json_data.get("objects", [])
-    if not objects:
-        return None
-
-    # 取最後一個矩形（使用者最新畫的）
-    rect = objects[-1]
-    # canvas 座標還原到原始影片座標
-    x = int(rect["left"] / scale)
-    y = int(rect["top"] / scale)
-    w = int((rect["width"] * rect.get("scaleX", 1)) / scale)
-    h = int((rect["height"] * rect.get("scaleY", 1)) / scale)
-
+def box_to_roi(box: tuple, img_w: int, img_h: int) -> dict | None:
+    """將 st_cropper 回傳的 box 轉為 ROI dict。"""
+    left, upper, right, lower = box
+    x, y = int(left), int(upper)
+    w, h = int(right - left), int(lower - upper)
+    x = max(0, min(x, img_w - 1))
+    y = max(0, min(y, img_h - 1))
+    w = min(w, img_w - x)
+    h = min(h, img_h - y)
     if w < 10 or h < 10:
         return None
-
-    return {"x": max(0, x), "y": max(0, y), "w": w, "h": h}
+    return {"x": x, "y": y, "w": w, "h": h}
 
 
 # ─────────────────────────────────────────────
@@ -210,33 +201,28 @@ st.success(
 # ─────────────────────────────────────────────
 st.header("📐 Step 1：框選你的球場範圍")
 st.markdown(
-    "**直接在下方畫面上拖拉畫一個矩形**，把你的球場框起來。"
+    "**拖動下方的裁切框**，把你的球場框起來。"
     "框外的區域（例如隔壁球場）會被忽略。"
 )
-st.caption("💡 可以重複畫，系統只會取最後一個矩形。按左下角 🗑️ 可以清除重畫。")
+st.caption("💡 拖動邊角或邊線來調整範圍，框好後繼續下一步即可。")
 
 if first_frame is not None:
     frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
     bg_image = Image.fromarray(frame_rgb)
 
     fw, fh = video_info["width"], video_info["height"]
-    # 將畫布寬度限制在合理範圍，等比縮放
-    canvas_display_w = min(900, fw)
-    scale = canvas_display_w / fw
-    canvas_display_h = int(fh * scale)
 
-    canvas_result = st_canvas(
-        fill_color="rgba(0, 255, 0, 0.15)",
-        stroke_width=3,
-        stroke_color="#00FF00",
-        background_image=bg_image,
-        drawing_mode="rect",
-        width=canvas_display_w,
-        height=canvas_display_h,
-        key="roi_canvas",
+    # st_cropper：直接拖拉裁切框
+    cropped = st_cropper(
+        bg_image,
+        realtime_update=True,
+        box_color="#00FF00",
+        aspect_ratio=None,  # 自由比例
+        return_type="box",
+        key="roi_cropper",
     )
 
-    roi = extract_roi_from_canvas(canvas_result, scale)
+    roi = box_to_roi(cropped, fw, fh)
 
     if roi:
         st.info(
@@ -244,7 +230,7 @@ if first_frame is not None:
             f"寬={roi['w']}, 高={roi['h']}**"
         )
     else:
-        st.warning("請在上方畫面上拖拉畫一個矩形來選取球場範圍")
+        st.warning("請在上方畫面中調整裁切框來選取球場範圍")
         st.stop()
 else:
     st.error("無法讀取影片第一幀")
