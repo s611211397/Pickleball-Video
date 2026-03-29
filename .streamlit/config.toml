@@ -1,0 +1,2 @@
+[server]
+maxUploadSize = 2048  # MB，預設 200，這裡設為 2GB
