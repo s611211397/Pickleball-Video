@@ -8,6 +8,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import streamlit as st
+from PIL import Image
+from streamlit_drawable_canvas import st_canvas
 
 from src.audio_analyzer import detect_hits, extract_audio
 from src.motion_detector import analyze_video_motion
@@ -55,20 +57,6 @@ def get_video_info(video_path: str) -> dict:
     return info
 
 
-def draw_roi_on_frame(frame: np.ndarray, roi: dict) -> np.ndarray:
-    """在幀上繪製 ROI 矩形。"""
-    vis = frame.copy()
-    x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
-    # 半透明遮罩：ROI 外部變暗
-    overlay = vis.copy()
-    overlay[:] = (overlay * 0.4).astype(np.uint8)
-    overlay[y:y+h, x:x+w] = vis[y:y+h, x:x+w]
-    vis = overlay
-    # 綠色邊框
-    cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 3)
-    return vis
-
-
 def draw_timeline_chart(
     motion_timeline: list[dict],
     segments: list[Segment],
@@ -84,6 +72,29 @@ def draw_timeline_chart(
         show=False,
     )
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+
+def extract_roi_from_canvas(canvas_result, scale: float) -> dict | None:
+    """從 drawable canvas 結果中取出 ROI 矩形座標。"""
+    if canvas_result is None or canvas_result.json_data is None:
+        return None
+
+    objects = canvas_result.json_data.get("objects", [])
+    if not objects:
+        return None
+
+    # 取最後一個矩形（使用者最新畫的）
+    rect = objects[-1]
+    # canvas 座標還原到原始影片座標
+    x = int(rect["left"] / scale)
+    y = int(rect["top"] / scale)
+    w = int((rect["width"] * rect.get("scaleX", 1)) / scale)
+    h = int((rect["height"] * rect.get("scaleY", 1)) / scale)
+
+    if w < 10 or h < 10:
+        return None
+
+    return {"x": max(0, x), "y": max(0, y), "w": w, "h": h}
 
 
 # ─────────────────────────────────────────────
@@ -156,7 +167,6 @@ with st.sidebar:
 # ─── 主區域 ───
 
 if uploaded is None:
-    # 歡迎畫面
     st.info("👈 請先在左側上傳匹克球影片")
 
     col1, col2, col3 = st.columns(3)
@@ -165,7 +175,7 @@ if uploaded is None:
         st.markdown("從左側面板拖拉影片檔")
     with col2:
         st.markdown("### 2️⃣ 框選球場")
-        st.markdown("用滑桿選取你的球場範圍")
+        st.markdown("在畫面上直接拖拉框選你的球場")
     with col3:
         st.markdown("### 3️⃣ 一鍵剪輯")
         st.markdown("按下按鈕，自動產出精華影片")
@@ -181,15 +191,13 @@ if "video_path" not in st.session_state or st.session_state.get("_uploaded_name"
     tmp.close()
     st.session_state["video_path"] = tmp.name
     st.session_state["_uploaded_name"] = uploaded.name
-    # 清除之前的分析結果
-    for k in ["motion_timeline", "hit_times", "segments", "output_files"]:
+    for k in ["motion_timeline", "hit_times", "segments", "output_files", "merged_path"]:
         st.session_state.pop(k, None)
 
 video_path = st.session_state["video_path"]
 video_info = get_video_info(video_path)
 first_frame = get_first_frame(video_path)
 
-# 影片資訊
 st.success(
     f"✅ 已載入：**{uploaded.name}**　｜　"
     f"{video_info['width']}x{video_info['height']}　｜　"
@@ -198,29 +206,49 @@ st.success(
 )
 
 # ─────────────────────────────────────────────
-# Step 1: ROI 框選
+# Step 1: ROI 框選（drawable canvas）
 # ─────────────────────────────────────────────
 st.header("📐 Step 1：框選你的球場範圍")
-st.caption("拖動滑桿調整綠色框，框住你要分析的球場區域，ROI 以外的動態會被忽略")
+st.markdown(
+    "**直接在下方畫面上拖拉畫一個矩形**，把你的球場框起來。"
+    "框外的區域（例如隔壁球場）會被忽略。"
+)
+st.caption("💡 可以重複畫，系統只會取最後一個矩形。按左下角 🗑️ 可以清除重畫。")
 
-fw, fh = video_info["width"], video_info["height"]
+if first_frame is not None:
+    frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+    bg_image = Image.fromarray(frame_rgb)
 
-col_sliders, col_preview = st.columns([1, 2])
+    fw, fh = video_info["width"], video_info["height"]
+    # 將畫布寬度限制在合理範圍，等比縮放
+    canvas_display_w = min(900, fw)
+    scale = canvas_display_w / fw
+    canvas_display_h = int(fh * scale)
 
-with col_sliders:
-    roi_x = st.slider("左邊界 (X)", 0, fw - 10, 0, key="roi_x")
-    roi_y = st.slider("上邊界 (Y)", 0, fh - 10, 0, key="roi_y")
-    roi_w = st.slider("寬度 (W)", 10, fw - roi_x, fw - roi_x, key="roi_w")
-    roi_h = st.slider("高度 (H)", 10, fh - roi_y, fh - roi_y, key="roi_h")
+    canvas_result = st_canvas(
+        fill_color="rgba(0, 255, 0, 0.15)",
+        stroke_width=3,
+        stroke_color="#00FF00",
+        background_image=bg_image,
+        drawing_mode="rect",
+        width=canvas_display_w,
+        height=canvas_display_h,
+        key="roi_canvas",
+    )
 
-roi = {"x": roi_x, "y": roi_y, "w": roi_w, "h": roi_h}
+    roi = extract_roi_from_canvas(canvas_result, scale)
 
-with col_preview:
-    if first_frame is not None:
-        vis = draw_roi_on_frame(first_frame, roi)
-        st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), use_container_width=True)
+    if roi:
+        st.info(
+            f"✅ 已選取球場範圍：**X={roi['x']}, Y={roi['y']}, "
+            f"寬={roi['w']}, 高={roi['h']}**"
+        )
     else:
-        st.warning("無法讀取影片第一幀")
+        st.warning("請在上方畫面上拖拉畫一個矩形來選取球場範圍")
+        st.stop()
+else:
+    st.error("無法讀取影片第一幀")
+    st.stop()
 
 # ─────────────────────────────────────────────
 # Step 2: 開始分析
@@ -228,8 +256,7 @@ with col_preview:
 st.header("🔍 Step 2：分析影片")
 
 if st.button("🚀 開始分析", type="primary", use_container_width=True):
-    # 清除之前的結果
-    for k in ["motion_timeline", "hit_times", "segments", "output_files"]:
+    for k in ["motion_timeline", "hit_times", "segments", "output_files", "merged_path"]:
         st.session_state.pop(k, None)
 
     progress = st.progress(0, text="準備中...")

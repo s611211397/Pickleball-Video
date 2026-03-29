@@ -6,3 +6,4 @@ pyyaml>=6.0
 click>=8.1.0
 tqdm>=4.65.0
 streamlit>=1.30.0
+streamlit-drawable-canvas>=0.9.3
