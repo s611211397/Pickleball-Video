@@ -1,5 +1,7 @@
 """視覺動態分析模組 — 偵測球場內的運動狀態"""
 
+from collections import deque
+
 import cv2
 import numpy as np
 from tqdm import tqdm
@@ -14,8 +16,8 @@ def compute_motion_score(
     """計算 ROI 區域內的動態分數。
 
     Args:
-        frame_prev: 前一幀
-        frame_curr: 當前幀
+        frame_prev: 前一幀（灰階已裁切）或完整 BGR 幀
+        frame_curr: 當前幀（同上）
         roi: ROI 座標 {"x", "y", "w", "h"}
         gaussian_kernel: 高斯模糊核大小
 
@@ -47,11 +49,42 @@ def compute_motion_score(
     return motion_score
 
 
+def smooth_timeline(
+    timeline: list[dict],
+    window_size: int = 5,
+) -> list[dict]:
+    """對動態時序做滑動平均平滑化，降低瞬間雜訊。
+
+    Args:
+        timeline: 原始動態時序 [{"time", "score"}, ...]
+        window_size: 滑動窗口大小（奇數較佳）
+
+    Returns:
+        平滑後的時序
+    """
+    if len(timeline) <= window_size:
+        return timeline
+
+    scores = [p["score"] for p in timeline]
+    smoothed_scores = []
+    buf = deque(maxlen=window_size)
+
+    for s in scores:
+        buf.append(s)
+        smoothed_scores.append(sum(buf) / len(buf))
+
+    return [
+        {"time": timeline[i]["time"], "score": smoothed_scores[i]}
+        for i in range(len(timeline))
+    ]
+
+
 def analyze_video_motion(
     video_path: str,
     roi: dict,
     frame_skip: int = 2,
     gaussian_kernel: int = 21,
+    smooth_window: int = 5,
 ) -> list[dict]:
     """分析整段影片的動態時序資料。
 
@@ -60,6 +93,7 @@ def analyze_video_motion(
         roi: ROI 座標
         frame_skip: 每 N 幀分析一次
         gaussian_kernel: 高斯模糊核大小
+        smooth_window: 平滑窗口大小（0 = 不平滑）
 
     Returns:
         動態時序列表 [{"time": float, "score": float}, ...]
@@ -70,9 +104,20 @@ def analyze_video_motion(
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # 驗證 ROI 範圍
+    if (roi["x"] + roi["w"] > frame_w) or (roi["y"] + roi["h"] > frame_h):
+        cap.release()
+        raise ValueError(
+            f"ROI ({roi['x']},{roi['y']},{roi['w']},{roi['h']}) "
+            f"超出影片範圍 ({frame_w}x{frame_h})"
+        )
 
     ret, prev_frame = cap.read()
     if not ret:
+        cap.release()
         raise ValueError("無法讀取第一幀")
 
     timeline = []
@@ -98,4 +143,9 @@ def analyze_video_motion(
             pbar.update(1)
 
     cap.release()
+
+    # 平滑化
+    if smooth_window > 0 and len(timeline) > smooth_window:
+        timeline = smooth_timeline(timeline, smooth_window)
+
     return timeline

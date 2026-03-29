@@ -9,6 +9,7 @@ motion:
   threshold: 0.08             # 動態分數門檻 (0.0-1.0)
   frame_skip: 2               # 每 N 幀分析一次（加速處理）
   gaussian_kernel: 21         # 高斯模糊核大小（降噪用）
+  smooth_window: 5            # 動態分數平滑窗口大小（0 = 不平滑）
 
 # 音訊偵測參數
 audio:

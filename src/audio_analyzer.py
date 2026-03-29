@@ -48,8 +48,9 @@ def bandpass_filter(
 ) -> np.ndarray:
     """帶通濾波：只保留擊球聲頻率範圍。"""
     nyquist = sr / 2
-    low = low_freq / nyquist
-    high = high_freq / nyquist
+    # 確保頻率在有效範圍內
+    low = max(low_freq, 1) / nyquist
+    high = min(high_freq, nyquist - 1) / nyquist
     b, a = butter(order, [low, high], btype="band")
     return filtfilt(b, a, signal)
 
@@ -67,7 +68,7 @@ def detect_hits(
         audio_path: WAV 音軌路徑
         bandpass_low: 帶通濾波下限 (Hz)
         bandpass_high: 帶通濾波上限 (Hz)
-        energy_threshold: 能量門檻（相對於最大值的比例）
+        energy_threshold: 能量門檻（用於自適應門檻計算）
         min_hit_interval: 最小擊球間距 (秒)
 
     Returns:
@@ -76,36 +77,68 @@ def detect_hits(
     # 載入音軌
     y, sr = librosa.load(audio_path, sr=None)
 
+    if len(y) == 0:
+        return []
+
     # 帶通濾波
     y_filtered = bandpass_filter(y, sr, bandpass_low, bandpass_high)
 
-    # 計算短時能量（窗口 ~23ms at 22050Hz）
+    # 計算短時能量 — 使用向量化操作加速
     hop_length = 512
     frame_length = 1024
-    energy = np.array([
-        np.sum(y_filtered[i : i + frame_length] ** 2)
-        for i in range(0, len(y_filtered) - frame_length, hop_length)
-    ])
+    energy = _compute_short_time_energy(y_filtered, frame_length, hop_length)
+
+    if len(energy) == 0:
+        return []
 
     # 正規化能量
-    if energy.max() > 0:
-        energy = energy / energy.max()
+    max_energy = energy.max()
+    if max_energy > 0:
+        energy = energy / max_energy
 
-    # 自適應門檻：取中位數 + 倍率
+    # 自適應門檻：中位數 + 倍率 * 標準差
+    # 這樣可以適應不同錄音環境的噪音水準
+    median_e = np.median(energy)
+    std_e = np.std(energy)
     adaptive_threshold = max(
         energy_threshold,
-        np.median(energy) + energy_threshold * np.std(energy),
+        median_e + energy_threshold * std_e * 3,
     )
+    # 但不能超過 0.95，否則什麼都偵測不到
+    adaptive_threshold = min(adaptive_threshold, 0.95)
 
     # 峰值偵測
-    min_distance = int(min_hit_interval * sr / hop_length)
-    peaks, properties = find_peaks(
+    min_distance = max(1, int(min_hit_interval * sr / hop_length))
+    peaks, _ = find_peaks(
         energy,
         height=adaptive_threshold,
         distance=min_distance,
+        prominence=0.1,  # 峰值需有一定的突出度，過濾平坦的高能量段
     )
 
     # 轉換為時間點
     hit_times = [float(p * hop_length / sr) for p in peaks]
 
     return hit_times
+
+
+def _compute_short_time_energy(
+    signal: np.ndarray,
+    frame_length: int,
+    hop_length: int,
+) -> np.ndarray:
+    """向量化計算短時能量。比 list comprehension 快 10-50 倍。"""
+    # 計算可以產生多少個完整的 frame
+    n_frames = max(0, (len(signal) - frame_length) // hop_length + 1)
+    if n_frames == 0:
+        return np.array([])
+
+    # 建立 strided view 避免複製記憶體
+    shape = (n_frames, frame_length)
+    strides = (signal.strides[0] * hop_length, signal.strides[0])
+    frames = np.lib.stride_tricks.as_strided(signal, shape=shape, strides=strides)
+
+    # 每個 frame 的能量 = sum of squares
+    energy = np.sum(frames ** 2, axis=1)
+
+    return energy
