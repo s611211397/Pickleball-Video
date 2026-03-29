@@ -74,11 +74,16 @@ def draw_timeline_chart(
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
 
-def box_to_roi(box: tuple, img_w: int, img_h: int) -> dict | None:
+def box_to_roi(box, img_w: int, img_h: int) -> dict | None:
     """將 st_cropper 回傳的 box 轉為 ROI dict。"""
-    left, upper, right, lower = box
-    x, y = int(left), int(upper)
-    w, h = int(right - left), int(lower - upper)
+    if isinstance(box, dict):
+        left, upper = box["left"], box["top"]
+        w, h = int(box["width"]), int(box["height"])
+        x, y = int(left), int(upper)
+    else:
+        left, upper, right, lower = box
+        x, y = int(left), int(upper)
+        w, h = int(right - left), int(lower - upper)
     x = max(0, min(x, img_w - 1))
     y = max(0, min(y, img_h - 1))
     w = min(w, img_w - x)
