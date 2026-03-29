@@ -3,70 +3,94 @@
 import numpy as np
 import pytest
 
-from src.motion_detector import compute_motion_score, smooth_timeline
+from src.motion_detector import (
+    _auto_frame_skip,
+    _extract_roi_gray,
+    compute_motion_score,
+    smooth_timeline,
+)
 
 
 class TestComputeMotionScore:
-    def _make_frame(self, w, h, color=(0, 0, 0)):
-        """建立指定顏色的 BGR 幀。"""
-        frame = np.zeros((h, w, 3), dtype=np.uint8)
-        frame[:] = color
-        return frame
+    def _make_gray(self, w, h, value=0):
+        """建立指定灰度值的灰階幀。"""
+        return np.full((h, w), value, dtype=np.uint8)
 
     def test_identical_frames_zero_motion(self):
-        frame = self._make_frame(200, 200, (128, 128, 128))
-        roi = {"x": 0, "y": 0, "w": 200, "h": 200}
-        score = compute_motion_score(frame, frame.copy(), roi)
+        gray = self._make_gray(200, 200, 128)
+        score = compute_motion_score(gray, gray.copy())
         assert score == 0.0
 
     def test_completely_different_frames_high_motion(self):
-        frame1 = self._make_frame(200, 200, (0, 0, 0))
-        frame2 = self._make_frame(200, 200, (255, 255, 255))
-        roi = {"x": 0, "y": 0, "w": 200, "h": 200}
-        score = compute_motion_score(frame1, frame2, roi)
+        gray1 = self._make_gray(200, 200, 0)
+        gray2 = self._make_gray(200, 200, 255)
+        score = compute_motion_score(gray1, gray2)
         assert score > 0.5
 
     def test_partial_motion(self):
-        frame1 = self._make_frame(200, 200, (100, 100, 100))
-        frame2 = frame1.copy()
-        # 只改右半邊
-        frame2[:, 100:] = (200, 200, 200)
-        roi = {"x": 0, "y": 0, "w": 200, "h": 200}
-        score = compute_motion_score(frame1, frame2, roi)
+        gray1 = self._make_gray(200, 200, 100)
+        gray2 = gray1.copy()
+        gray2[:, 100:] = 200
+        score = compute_motion_score(gray1, gray2)
         assert 0.1 < score < 0.9
 
-    def test_roi_crops_correctly(self):
-        frame1 = self._make_frame(400, 400, (100, 100, 100))
-        frame2 = frame1.copy()
-        # 只在左上角 100x100 區域有變化
-        frame2[0:100, 0:100] = (255, 255, 255)
 
-        # ROI 在變化區域 → 高動態
+class TestExtractRoiGray:
+    def test_basic_extract(self):
+        frame = np.zeros((400, 400, 3), dtype=np.uint8)
+        frame[50:150, 100:300] = (255, 255, 255)  # 白色區域
+        roi = {"x": 100, "y": 50, "w": 200, "h": 100}
+        gray = _extract_roi_gray(frame, roi, scale=1.0)
+        assert gray.shape == (100, 200)
+        assert gray.mean() == 255
+
+    def test_extract_with_downscale(self):
+        frame = np.zeros((800, 800, 3), dtype=np.uint8)
+        roi = {"x": 0, "y": 0, "w": 800, "h": 800}
+        gray = _extract_roi_gray(frame, roi, scale=0.5)
+        assert gray.shape == (400, 400)
+
+    def test_roi_isolates_region(self):
+        frame = np.zeros((400, 400, 3), dtype=np.uint8)
+        frame[0:100, 0:100] = (255, 255, 255)
+
         roi_hit = {"x": 0, "y": 0, "w": 100, "h": 100}
-        score_hit = compute_motion_score(frame1, frame2, roi_hit)
-
-        # ROI 在沒變化的區域 → 低動態
         roi_miss = {"x": 200, "y": 200, "w": 100, "h": 100}
-        score_miss = compute_motion_score(frame1, frame2, roi_miss)
 
-        assert score_hit > score_miss
-        assert score_miss == 0.0
+        gray_hit = _extract_roi_gray(frame, roi_hit, 1.0)
+        gray_miss = _extract_roi_gray(frame, roi_miss, 1.0)
+
+        assert gray_hit.mean() == 255
+        assert gray_miss.mean() == 0
+
+
+class TestAutoFrameSkip:
+    def test_short_video(self):
+        # 2 分鐘 @ 30fps
+        skip = _auto_frame_skip(30.0, 30 * 120)
+        assert skip == 3
+
+    def test_medium_video(self):
+        # 15 分鐘 @ 30fps
+        skip = _auto_frame_skip(30.0, 30 * 900)
+        assert skip == 5
+
+    def test_long_video(self):
+        # 60 分鐘 @ 30fps
+        skip = _auto_frame_skip(30.0, 30 * 3600)
+        assert skip == 8
 
 
 class TestSmoothTimeline:
     def test_smoothing_reduces_spikes(self):
-        # 建立一個有突然峰值的時序
         timeline = [
             {"time": i * 0.1, "score": 0.01}
             for i in range(20)
         ]
-        timeline[10]["score"] = 1.0  # 插入一個峰值
+        timeline[10]["score"] = 1.0
 
         smoothed = smooth_timeline(timeline, window_size=5)
-
-        # 峰值應該被平滑化
         assert smoothed[10]["score"] < 1.0
-        # 峰值的能量應該分散到鄰近點
         assert smoothed[11]["score"] > 0.01
 
     def test_empty_timeline(self):

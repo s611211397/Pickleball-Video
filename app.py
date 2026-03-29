@@ -253,10 +253,17 @@ if st.button("🚀 開始分析", type="primary", use_container_width=True):
     progress = st.progress(0, text="準備中...")
 
     # 2a: 視覺動態分析
-    progress.progress(5, text="🎬 分析影片動態中... 這可能需要一些時間")
+    progress.progress(5, text="🎬 分析影片動態中...")
+
+    def on_motion_progress(pct, msg):
+        # 動態分析佔整體進度的 5%~50%
+        progress.progress(5 + int(pct * 45), text=f"🎬 {msg}")
+
     motion_timeline = analyze_video_motion(
         video_path, roi,
-        frame_skip=2, gaussian_kernel=21, smooth_window=5,
+        frame_skip=0,  # 自動根據影片長度決定
+        gaussian_kernel=11, smooth_window=5,
+        progress_callback=on_motion_progress,
     )
     st.session_state["motion_timeline"] = motion_timeline
     progress.progress(50, text=f"🎬 動態分析完成，分析了 {len(motion_timeline)} 個時間點")

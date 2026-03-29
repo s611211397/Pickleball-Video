@@ -8,60 +8,34 @@ from tqdm import tqdm
 
 
 def compute_motion_score(
-    frame_prev: np.ndarray,
-    frame_curr: np.ndarray,
-    roi: dict,
-    gaussian_kernel: int = 21,
+    gray_prev: np.ndarray,
+    gray_curr: np.ndarray,
+    gaussian_kernel: int = 11,
 ) -> float:
-    """計算 ROI 區域內的動態分數。
+    """計算動態分數（輸入為已裁切+縮放的灰階幀）。
 
     Args:
-        frame_prev: 前一幀（灰階已裁切）或完整 BGR 幀
-        frame_curr: 當前幀（同上）
-        roi: ROI 座標 {"x", "y", "w", "h"}
+        gray_prev: 前一幀（灰階）
+        gray_curr: 當前幀（灰階）
         gaussian_kernel: 高斯模糊核大小
 
     Returns:
-        動態分數 (0.0 ~ 1.0)，越高代表動態越大
+        動態分數 (0.0 ~ 1.0)
     """
-    x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
-
-    # 裁切 ROI 區域
-    crop_prev = frame_prev[y : y + h, x : x + w]
-    crop_curr = frame_curr[y : y + h, x : x + w]
-
-    # 轉灰階
-    gray_prev = cv2.cvtColor(crop_prev, cv2.COLOR_BGR2GRAY)
-    gray_curr = cv2.cvtColor(crop_curr, cv2.COLOR_BGR2GRAY)
-
-    # 高斯模糊降噪
     k = (gaussian_kernel, gaussian_kernel)
-    gray_prev = cv2.GaussianBlur(gray_prev, k, 0)
-    gray_curr = cv2.GaussianBlur(gray_curr, k, 0)
+    blur_prev = cv2.GaussianBlur(gray_prev, k, 0)
+    blur_curr = cv2.GaussianBlur(gray_curr, k, 0)
 
-    # 幀差取絕對值
-    diff = cv2.absdiff(gray_prev, gray_curr)
-
-    # 二值化 + 計算動態像素佔比
+    diff = cv2.absdiff(blur_prev, blur_curr)
     _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-    motion_score = float(np.sum(thresh > 0)) / thresh.size
-
-    return motion_score
+    return float(np.count_nonzero(thresh)) / thresh.size
 
 
 def smooth_timeline(
     timeline: list[dict],
     window_size: int = 5,
 ) -> list[dict]:
-    """對動態時序做滑動平均平滑化，降低瞬間雜訊。
-
-    Args:
-        timeline: 原始動態時序 [{"time", "score"}, ...]
-        window_size: 滑動窗口大小（奇數較佳）
-
-    Returns:
-        平滑後的時序
-    """
+    """對動態時序做滑動平均平滑化，降低瞬間雜訊。"""
     if len(timeline) <= window_size:
         return timeline
 
@@ -79,21 +53,58 @@ def smooth_timeline(
     ]
 
 
+def _auto_frame_skip(fps: float, total_frames: int) -> int:
+    """根據影片長度自動決定 frame_skip。
+
+    短片（<5 分鐘）: 每 3 幀
+    中片（5-30 分鐘）: 每 5 幀
+    長片（>30 分鐘）: 每 8 幀
+
+    動態偵測不需要每幀都看，每 0.2-0.3 秒看一次就夠了。
+    """
+    duration = total_frames / fps if fps > 0 else 0
+    if duration < 300:
+        return 3
+    elif duration < 1800:
+        return 5
+    else:
+        return 8
+
+
+def _extract_roi_gray(frame: np.ndarray, roi: dict, scale: float) -> np.ndarray:
+    """從幀中裁切 ROI 區域，轉灰階，並縮放。"""
+    x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
+    crop = frame[y:y+h, x:x+w]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    if scale < 1.0:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    return gray
+
+
 def analyze_video_motion(
     video_path: str,
     roi: dict,
-    frame_skip: int = 2,
-    gaussian_kernel: int = 21,
+    frame_skip: int = 0,
+    gaussian_kernel: int = 11,
     smooth_window: int = 5,
+    max_roi_dim: int = 320,
+    progress_callback=None,
 ) -> list[dict]:
     """分析整段影片的動態時序資料。
+
+    主要優化：
+    - 跳過的幀用 grab() 而非 read()，避免無謂的完整解碼（快 3-5 倍）
+    - ROI 區域縮放到 max_roi_dim 以內，大幅降低像素運算量
+    - 自動根據影片長度決定 frame_skip
 
     Args:
         video_path: 影片路徑
         roi: ROI 座標
-        frame_skip: 每 N 幀分析一次
+        frame_skip: 每 N 幀分析一次（0 = 自動決定）
         gaussian_kernel: 高斯模糊核大小
         smooth_window: 平滑窗口大小（0 = 不平滑）
+        max_roi_dim: ROI 縮放後的最大邊長（像素）
+        progress_callback: 進度回呼 fn(pct: float, msg: str)
 
     Returns:
         動態時序列表 [{"time": float, "score": float}, ...]
@@ -107,7 +118,6 @@ def analyze_video_motion(
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # 驗證 ROI 範圍
     if (roi["x"] + roi["w"] > frame_w) or (roi["y"] + roi["h"] > frame_h):
         cap.release()
         raise ValueError(
@@ -115,36 +125,64 @@ def analyze_video_motion(
             f"超出影片範圍 ({frame_w}x{frame_h})"
         )
 
-    ret, prev_frame = cap.read()
+    # 自動決定 frame_skip
+    if frame_skip <= 0:
+        frame_skip = _auto_frame_skip(fps, total_frames)
+
+    # 計算 ROI 縮放比例（動態偵測不需要全解析度）
+    roi_max_side = max(roi["w"], roi["h"])
+    roi_scale = min(1.0, max_roi_dim / roi_max_side) if roi_max_side > max_roi_dim else 1.0
+
+    # 讀第一幀
+    ret, first_frame = cap.read()
     if not ret:
         cap.release()
         raise ValueError("無法讀取第一幀")
 
+    prev_gray = _extract_roi_gray(first_frame, roi, roi_scale)
+
     timeline = []
     frame_idx = 1
+    analyze_count = 0
+
+    duration_sec = total_frames / fps if fps > 0 else 0
+    estimated_points = total_frames // frame_skip
 
     with tqdm(total=total_frames, desc="分析動態", unit="frame") as pbar:
         while True:
-            ret, curr_frame = cap.read()
-            if not ret:
-                break
-
             if frame_idx % frame_skip == 0:
-                score = compute_motion_score(
-                    prev_frame, curr_frame, roi, gaussian_kernel
-                )
+                # 需要分析的幀：完整解碼
+                ret = cap.grab()
+                if not ret:
+                    break
+                ret, curr_frame = cap.retrieve()
+                if not ret:
+                    break
+
+                curr_gray = _extract_roi_gray(curr_frame, roi, roi_scale)
+                score = compute_motion_score(prev_gray, curr_gray, gaussian_kernel)
+
                 timeline.append({
                     "time": frame_idx / fps,
                     "score": score,
                 })
-                prev_frame = curr_frame
+                prev_gray = curr_gray
+                analyze_count += 1
+
+                # 進度回呼（給 Streamlit UI 用）
+                if progress_callback and analyze_count % 50 == 0:
+                    pct = frame_idx / total_frames
+                    progress_callback(pct, f"已分析 {analyze_count} 個時間點...")
+            else:
+                # 跳過的幀：只 grab 不 decode，快很多
+                if not cap.grab():
+                    break
 
             frame_idx += 1
             pbar.update(1)
 
     cap.release()
 
-    # 平滑化
     if smooth_window > 0 and len(timeline) > smooth_window:
         timeline = smooth_timeline(timeline, smooth_window)
 
