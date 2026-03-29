@@ -1,0 +1,35 @@
+# Pickleball Auto-Editor 設定檔
+
+# ROI 設定
+roi:
+  config_file: "roi.json"     # ROI 座標檔路徑
+
+# 視覺偵測參數
+motion:
+  threshold: 0.08             # 動態分數門檻 (0.0-1.0)
+  frame_skip: 2               # 每 N 幀分析一次（加速處理）
+  gaussian_kernel: 21         # 高斯模糊核大小（降噪用）
+
+# 音訊偵測參數
+audio:
+  enabled: true               # 是否啟用音訊輔助
+  bandpass_low: 1000          # 帶通濾波下限 (Hz)
+  bandpass_high: 4000         # 帶通濾波上限 (Hz)
+  energy_threshold: 0.5       # 能量門檻（相對值，0.0-1.0）
+  min_hit_interval: 0.3       # 最小擊球間距 (秒)
+
+# Rally 偵測參數
+rally:
+  gap_threshold: 4.0          # 無活動間隔，幾秒算一分結束 (秒)
+  min_duration: 3.0           # 最短 rally 時長，低於此視為雜訊 (秒)
+  activity_threshold: 0.3     # 綜合活動分數門檻 (0.0-1.0)
+  motion_weight: 0.7          # 視覺權重
+  audio_weight: 0.3           # 音訊權重
+
+# 輸出設定
+output:
+  buffer_before: 2.0          # rally 前 buffer (秒)
+  buffer_after: 2.0           # rally 後 buffer (秒)
+  mode: "merged"              # "merged" 合併成單一影片 / "segments" 分段輸出
+  reencode: false             # 是否重新編碼（true=精確切點但慢, false=快速但切點可能差幾幀）
+  format: "mp4"               # 輸出格式
