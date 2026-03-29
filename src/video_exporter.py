@@ -106,10 +106,12 @@ def _cut_segment(
             "-y", output_path,
         ]
     else:
+        # 快速模式：-ss 在 -i 之前，利用 keyframe seek
+        # 注意：-ss 在 -i 前時，用 -t（持續時間）而非 -to（絕對時間）
         args = [
             "-ss", f"{start:.3f}",
-            "-to", f"{end - start:.3f}",
             "-i", video_path,
+            "-t", f"{end - start:.3f}",
             "-c", "copy",
             "-avoid_negative_ts", "make_zero",
             "-y", output_path,
