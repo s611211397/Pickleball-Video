@@ -8,12 +8,15 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 from streamlit_cropper import st_cropper
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 from src.audio_analyzer import detect_hits, extract_audio
-from src.court_detector import detect_courts, draw_courts_on_frame
+from src.court_detector import detect_courts, draw_courts_on_frame, compute_roi_from_keypoints
 from src.motion_detector import analyze_video_motion
 from src.rally_detector import Segment, detect_rallies
 from src.video_exporter import export_segments, merge_segments
+from src.yolo_tracker import analyze_video_with_yolo
+from src.dataset_manager import DatasetManager
 
 # ─────────────────────────────────────────────
 # 頁面設定
@@ -23,6 +26,49 @@ st.set_page_config(
     page_icon="🏓",
     layout="wide",
 )
+
+# ─────────────────────────────────────────────
+# 側邊欄：模型持續學習中心
+# ─────────────────────────────────────────────
+with st.sidebar:
+    st.header("🧠 YOLO 模型優化")
+    st.caption("透過您「手動指正」的錯誤影像來提升 AI 的準確度！")
+    
+    # 算一下目前標註了多少張圖
+    label_path = Path("dataset/labels/train")
+    if label_path.exists():
+        num_labels = len(list(label_path.glob("*.txt")))
+    else:
+        num_labels = 0
+        
+    st.metric("累積可訓練的「問題幀」數量", f"{num_labels} 張")
+    
+    if num_labels > 0:
+        if st.button("🚀 開始 Fine-tune 訓練", use_container_width=True, type="primary"):
+            st.warning("⚠️ 訓練期間將會占用 GPU 資源，且可能耗時數分鐘到數十分鐘。請勿關閉或重新整理此視窗。詳細進度會顯示於運行本程式的終端機。")
+            with st.spinner("⏳ 正在訓練 YOLOv8 模型中，請查看終端機黑窗..."):
+                import subprocess
+                try:
+                    # 使用 subprocess 呼叫，避免 Streamlit 迴圈阻塞輸出
+                    result = subprocess.run(
+                        ["python", "train_model.py"],
+                        capture_output=True,
+                        text=True,
+                        check=False
+                    )
+                    if result.returncode == 0:
+                        st.success("✅ 訓練大成功！系統已將最新的完美權重部署完成。下次重新分析影片即會自動套用。")
+                        st.balloons()
+                    else:
+                        st.error("❌ 訓練失敗。")
+                        with st.expander("查看詳細錯誤 Log"):
+                            st.code(result.stderr[-2000:], language="bash")
+                except Exception as e:
+                    st.error(f"無法啟動訓練腳本: {e}")
+    else:
+        st.info("💡 目前還沒有問題幀資料。\n請多上傳比賽影片，並在「Step 2.5：軌跡迷失審核」步驟中，點選畫面指示正確位置來累積訓練素材！")
+
+    st.divider()
 
 # ─────────────────────────────────────────────
 # 工具函式
@@ -216,21 +262,42 @@ if len(courts) >= 2:
 
     # 提供手動微調選項
     with st.expander("🔧 手動微調範圍"):
-        st.caption("如果自動偵測不夠精確，可以在這裡拖拉調整。")
-        frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
-        bg_image = Image.fromarray(frame_rgb)
-        cropped = st_cropper(
-            bg_image, realtime_update=True,
-            box_color="#00FF00", aspect_ratio=None,
-            return_type="box", key="roi_cropper_adjust",
-        )
-        manual_roi = box_to_roi(cropped, fw, fh)
-        if manual_roi and st.button("使用手動選取的範圍"):
-            roi = manual_roi
-            st.session_state["selected_court"] = -1  # 標記為手動
-            for k in ["motion_timeline", "hit_times", "segments", "output_files", "merged_path"]:
-                st.session_state.pop(k, None)
-            st.rerun()
+        st.caption("請依序點擊：**左上角 ➔ 右上角 ➔ 左下角 ➔ 右下角** 來自訂斜線邊界")
+        if "court_points_adjust" not in st.session_state:
+            st.session_state["court_points_adjust"] = []
+            
+        frame_rgb2 = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+        for i, pt in enumerate(st.session_state["court_points_adjust"]):
+            cv2.circle(frame_rgb2, (pt["x"], pt["y"]), 8, (0, 0, 255), -1)
+            cv2.putText(frame_rgb2, str(i+1), (pt["x"]+12, pt["y"]-12), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+            
+        if len(st.session_state["court_points_adjust"]) == 4:
+            pts = np.array([[[p["x"], p["y"]] for p in st.session_state["court_points_adjust"]]], dtype=np.int32)
+            cv2.polylines(frame_rgb2, [pts], isClosed=True, color=(0, 255, 0), thickness=3)
+
+        value = streamlit_image_coordinates(Image.fromarray(frame_rgb2), key="roi_points_adjust")
+        
+        if value is not None:
+            new_pt = {"x": value["x"], "y": value["y"]}
+            if new_pt not in st.session_state["court_points_adjust"]:
+                if len(st.session_state["court_points_adjust"]) < 4:
+                    st.session_state["court_points_adjust"].append(new_pt)
+                    st.rerun()
+                    
+        if len(st.session_state["court_points_adjust"]) == 4:
+            st.success("已集滿 4 個點！")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("清除重選", key="clear_pts_adjust"):
+                    st.session_state["court_points_adjust"] = []
+                    st.rerun()
+            with c2:
+                if st.button("使用這 4 個角落建立範圍", key="use_adjust_pts", type="primary"):
+                    roi = compute_roi_from_keypoints(st.session_state["court_points_adjust"])
+                    st.session_state["selected_court"] = -1
+                    for k in ["motion_timeline", "hit_times", "segments", "output_files", "merged_path"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
 
 elif len(courts) == 1:
     # 只偵測到一個場地 → 自動選取，顯示確認
@@ -244,40 +311,81 @@ elif len(courts) == 1:
 
     # 提供手動調整選項
     with st.expander("🔧 手動調整範圍（如果自動偵測不準確）"):
-        frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
-        bg_image = Image.fromarray(frame_rgb)
-        cropped = st_cropper(
-            bg_image, realtime_update=True,
-            box_color="#00FF00", aspect_ratio=None,
-            return_type="box", key="roi_cropper_single",
-        )
-        manual_roi = box_to_roi(cropped, fw, fh)
-        if manual_roi and st.button("使用手動選取的範圍 "):
-            roi = manual_roi
-            st.rerun()
+        st.caption("請依序點擊：**左上角 ➔ 右上角 ➔ 左下角 ➔ 右下角** 來自訂斜線邊界")
+        if "court_points_single" not in st.session_state:
+            st.session_state["court_points_single"] = []
+            
+        frame_rgb2 = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+        for i, pt in enumerate(st.session_state["court_points_single"]):
+            cv2.circle(frame_rgb2, (pt["x"], pt["y"]), 8, (0, 0, 255), -1)
+            cv2.putText(frame_rgb2, str(i+1), (pt["x"]+12, pt["y"]-12), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+            
+        if len(st.session_state["court_points_single"]) == 4:
+            pts = np.array([[[p["x"], p["y"]] for p in st.session_state["court_points_single"]]], dtype=np.int32)
+            cv2.polylines(frame_rgb2, [pts], isClosed=True, color=(0, 255, 0), thickness=3)
+
+        value = streamlit_image_coordinates(Image.fromarray(frame_rgb2), key="roi_points_single")
+        
+        if value is not None:
+            new_pt = {"x": value["x"], "y": value["y"]}
+            if new_pt not in st.session_state["court_points_single"]:
+                if len(st.session_state["court_points_single"]) < 4:
+                    st.session_state["court_points_single"].append(new_pt)
+                    st.rerun()
+                    
+        if len(st.session_state["court_points_single"]) == 4:
+            st.success("已集滿 4 個點！")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("清除重選", key="clear_pts_single"):
+                    st.session_state["court_points_single"] = []
+                    st.rerun()
+            with c2:
+                if st.button("使用這 4 個角落建立範圍", type="primary"):
+                    roi = compute_roi_from_keypoints(st.session_state["court_points_single"])
+                    st.session_state["selected_court"] = -1
+                    st.rerun()
 
 else:
     # 沒偵測到球場 → 手動框選
-    st.header("📐 請手動框選球場範圍")
-    st.caption("未自動偵測到球場，請拖動裁切框來選取你的球場。")
+    st.header("📐 請手動標註球場範圍")
+    st.caption("支援點擊斜線角點來畫出不規則（透視變形）的精確球場邊界。")
 
-    frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
-    bg_image = Image.fromarray(frame_rgb)
-    cropped = st_cropper(
-        bg_image, realtime_update=True,
-        box_color="#00FF00", aspect_ratio=None,
-        return_type="box", key="roi_cropper_manual",
-    )
-    roi = box_to_roi(cropped, fw, fh)
+    st.write("請依序點擊：**左上角 ➔ 右上角 ➔ 左下角 ➔ 右下角**")
+    if "court_points" not in st.session_state:
+        st.session_state["court_points"] = []
+        
+    frame_rgb2 = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+    for i, pt in enumerate(st.session_state["court_points"]):
+        cv2.circle(frame_rgb2, (pt["x"], pt["y"]), 8, (0, 0, 255), -1)
+        cv2.putText(frame_rgb2, str(i+1), (pt["x"]+12, pt["y"]-12), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+        
+    if len(st.session_state["court_points"]) == 4:
+        pts = np.array([[[p["x"], p["y"]] for p in st.session_state["court_points"]]], dtype=np.int32)
+        cv2.polylines(frame_rgb2, [pts], isClosed=True, color=(0, 255, 0), thickness=3)
 
-    if roi:
-        st.info(f"✅ 已選取範圍：X={roi['x']}, Y={roi['y']}, 寬={roi['w']}, 高={roi['h']}")
-    else:
-        st.warning("請在上方畫面中調整裁切框來選取球場範圍")
+    value = streamlit_image_coordinates(Image.fromarray(frame_rgb2), key="court_coords")
+    
+    if value is not None:
+        new_pt = {"x": value["x"], "y": value["y"]}
+        if new_pt not in st.session_state["court_points"]:
+            if len(st.session_state["court_points"]) < 4:
+                st.session_state["court_points"].append(new_pt)
+                st.rerun()
+                
+    if len(st.session_state["court_points"]) == 4:
+        st.success("已集滿 4 個點！")
+        if st.button("清除重選", key="clear_pts"):
+            st.session_state["court_points"] = []
+            st.rerun()
+        if st.button("使用這 4 個角落建立範圍", type="primary"):
+            roi = compute_roi_from_keypoints(st.session_state["court_points"])
+            st.session_state["selected_court"] = -1
+            st.rerun()
+
+    if roi is None:
+        st.warning("請在上方畫面中點出球場範圍的 4 個重點")
         st.stop()
-
-if roi is None:
-    st.stop()
 
 # ─────────────────────────────────────────────
 # Step 2: 開始分析
@@ -296,10 +404,16 @@ if st.button("🚀 開始分析", type="primary", use_container_width=True):
     def on_motion_progress(pct, msg):
         progress.progress(5 + int(pct * 45), text=f"🎬 {msg}")
 
+    # 執行 YOLO 追蹤
+    tracking_data, review_frames = analyze_video_with_yolo(video_path, roi, progress_callback=on_motion_progress)
+    st.session_state["tracking_data"] = tracking_data
+    st.session_state["review_frames"] = review_frames
+    st.session_state["current_review_idx"] = 0
+
+    # 同時執行傳統動態分析 (供後續相容)
     motion_timeline = analyze_video_motion(
         video_path, roi,
         frame_skip=0, gaussian_kernel=11, smooth_window=5,
-        progress_callback=on_motion_progress,
     )
     st.session_state["motion_timeline"] = motion_timeline
     progress.progress(50, text=f"🎬 動態分析完成，{len(motion_timeline)} 個時間點")
@@ -326,12 +440,69 @@ if st.button("🚀 開始分析", type="primary", use_container_width=True):
     motion_w = 1.0 - audio_weight
     segments = detect_rallies(
         motion_timeline, hit_times=hit_times,
+        tracking_data=st.session_state.get("tracking_data", []),
         gap_threshold=gap_threshold, min_duration=min_duration,
         activity_threshold=0.3, motion_weight=motion_w,
         audio_weight=audio_weight, motion_threshold=motion_threshold,
     )
     st.session_state["segments"] = segments
     progress.progress(100, text="✅ 分析完成！")
+    st.rerun()
+
+# ─────────────────────────────────────────────
+# Step 2.5: YOLO 軌跡審核 (Active Learning)
+# ─────────────────────────────────────────────
+if "review_frames" in st.session_state and "current_review_idx" in st.session_state:
+    review_frames = st.session_state["review_frames"]
+    tracking_data = st.session_state["tracking_data"]
+    idx = st.session_state["current_review_idx"]
+    
+    if len(review_frames) > 0 and idx < len(review_frames):
+        st.header("🧐 Step 2.5: 軌跡迷失審核 (主動學習標註)")
+        frame_idx = review_frames[idx]
+        data = tracking_data[frame_idx]
+        
+        st.write(f"正在審核第 **{idx+1} / {len(review_frames)}** 張相鄰疑似斷軌影像 (Frame: {frame_idx})")
+        st.caption("請在下方畫面上，直接點擊「球的確實位置」。如果這張圖球已經飛出場外或被擋死，點選右側「這張圖沒球」。")
+        
+        frame_bgr = data["frame"]
+        if frame_bgr is not None:
+            # ROI crop if desired or full frame? Full frame is better for labeling.
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                # 取得點擊座標
+                click_val = streamlit_image_coordinates(Image.fromarray(frame_rgb), key=f"review_{idx}")
+                
+            with c2:
+                if click_val is not None:
+                    # 進行紀錄
+                    dm = DatasetManager()
+                    box = {"x": click_val["x"] - 10, "y": click_val["y"] - 10, "w": 20, "h": 20}
+                    dm.save_annotation(frame_bgr, f"{Path(video_path).stem}_f{frame_idx}", box)
+                    
+                    # 覆蓋 tracking data 修正
+                    tracking_data[frame_idx]["box"] = box
+                    tracking_data[frame_idx]["conf"] = 1.0 
+                    tracking_data[frame_idx]["status"] = "DETECTED"
+                    
+                    st.session_state["current_review_idx"] += 1
+                    st.rerun()
+                    
+                if st.button("沒有球 / 飛出界外", use_container_width=True):
+                    dm = DatasetManager()
+                    dm.save_annotation(frame_bgr, f"{Path(video_path).stem}_f{frame_idx}", None)
+                    st.session_state["current_review_idx"] += 1
+                    st.rerun()
+                    
+                if st.button("略過", use_container_width=True):
+                    st.session_state["current_review_idx"] += 1
+                    st.rerun()
+        
+        st.stop() # 阻擋後續顯示，強制先標註完
+    elif len(review_frames) > 0 and idx >= len(review_frames):
+        st.success("✅ 所有問題軌跡皆審核標註完畢，並存入 dataset 供日後訓練使用！")
 
 # ─────────────────────────────────────────────
 # Step 3: 結果展示

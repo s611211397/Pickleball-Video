@@ -18,6 +18,7 @@ class Segment:
 def detect_rallies(
     motion_timeline: list[dict],
     hit_times: list[float] | None = None,
+    tracking_data: list[dict] | None = None,
     gap_threshold: float = 4.0,
     min_duration: float = 3.0,
     activity_threshold: float = 0.3,
@@ -53,7 +54,7 @@ def detect_rallies(
 
     # 計算每個時間點的綜合活動分數
     active_points = []
-    for point in motion_timeline:
+    for idx, point in enumerate(motion_timeline):
         t = point["time"]
         motion_score = point["score"]
 
@@ -64,7 +65,19 @@ def detect_rallies(
         has_hit = _has_nearby_hit(t, sorted_hits, window=0.5)
         audio_score = 1.0 if has_hit else 0.0
 
-        combined = motion_weight * normalized_motion + audio_weight * audio_score
+        # YOLO 追蹤判斷：如果狀態是偵測到，加強動態分數
+        yolo_boost = 0.0
+        if tracking_data and idx < len(tracking_data):
+            td = tracking_data[idx]
+            if td["status"] in ["DETECTED", "PREDICTED"]:
+                yolo_boost = 1.0  # YOLO 確認球在畫面內
+
+        # 融合加總 (給 YOLO 極高的權重)
+        # 如果 YOLO 有抓到，等同於畫面有大量動態
+        if tracking_data:
+            combined = (0.5 * normalized_motion + 0.5 * yolo_boost) * motion_weight + audio_weight * audio_score
+        else:
+            combined = motion_weight * normalized_motion + audio_weight * audio_score
 
         if combined >= activity_threshold:
             active_points.append(t)
