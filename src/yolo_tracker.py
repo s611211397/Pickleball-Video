@@ -145,10 +145,14 @@ class BallTracker:
 def analyze_video_with_yolo(video_path, roi, conf_thresh=0.2, high_conf_thresh=0.5, progress_callback=None):
     model_name = "yolov8n.pt"
     
-    # 若有客製化的模型則優先使用
-    custom_model = Path("dataset/runs/train/weights/best.pt")
-    if custom_model.exists():
-        model_name = str(custom_model)
+    # 若有客製化的備份模型則優先使用
+    custom_model_backup = Path("models/pickleball_best.pt")
+    custom_model_local = Path("dataset/runs/train/weights/best.pt")
+    
+    if custom_model_backup.exists():
+        model_name = str(custom_model_backup)
+    elif custom_model_local.exists():
+        model_name = str(custom_model_local)
         
     tracker = BallTracker(model_path=model_name, conf_thresh=conf_thresh, high_conf_thresh=high_conf_thresh)
     

@@ -35,7 +35,16 @@ def main():
     
     print("\n✅ 訓練完成！")
     print("最新權重已儲存在: dataset/runs/train/weights/best.pt")
-    print("下次在 Streamlit 進行影片分析時，系統將自動載入這個最新模型！")
+    
+    # 自動將產出模型複製到獨立資料夾以便 Git 追蹤
+    import shutil
+    os.makedirs("models", exist_ok=True)
+    best_weight_path = "dataset/runs/train/weights/best.pt"
+    if os.path.exists(best_weight_path):
+        shutil.copy(best_weight_path, "models/pickleball_best.pt")
+        print("💾 模型已自動備份至獨立資料夾: models/pickleball_best.pt (此檔案可提交至 Git)")
+
+    print("下次在 Streamlit 進行影片分析時，系統將自動優先載入這個最新模型！")
 
 if __name__ == "__main__":
     main()
