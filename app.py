@@ -479,22 +479,90 @@ if "review_frames" in st.session_state and "current_review_idx" in st.session_st
 
         # 顯示大圖（可點擊標記球的位置）
         if frame_bgr is not None:
-            h, w = frame_bgr.shape[:2]
-            if w > 960:
-                scale = 960 / w
-                frame_bgr = cv2.resize(frame_bgr, (960, int(h * scale)))
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            st.caption("👆 **直接點擊球的位置** 來標記座標，或使用下方按鈕快速操作")
+            orig_h, orig_w = frame_bgr.shape[:2]
+            scale = 1.0
+            if orig_w > 960:
+                scale = 960 / orig_w
+                disp_bgr = cv2.resize(frame_bgr, (960, int(orig_h * scale)))
+            else:
+                disp_bgr = frame_bgr
+                
+            frame_rgb = cv2.cvtColor(disp_bgr, cv2.COLOR_BGR2RGB)
+            st.caption("👆 **直接點擊球的位置** 來標記座標，系統會嘗試「自動追蹤」後續緊接的迷失畫面！")
+            
             click_val = streamlit_image_coordinates(Image.fromarray(frame_rgb), key=f"review_{idx}")
             if click_val is not None:
-                box = {"x": click_val["x"] - 10, "y": click_val["y"] - 10, "w": 20, "h": 20}
+                # 1. 換算回原始解析度的真實座標
+                orig_x = click_val["x"] / scale
+                orig_y = click_val["y"] / scale
+                bw, bh = 30 / scale, 30 / scale  # 點擊範圍擴大，以利後續追蹤
+                
+                box = {"x": orig_x - bw/2, "y": orig_y - bh/2, "w": bw, "h": bh}
+                
+                # 紀錄當前點擊的這一幀
                 st.session_state["pending_annotations"].append(
-                    (data["frame"], f"{Path(video_path).stem}_f{frame_idx}", box)
+                    (frame_bgr, f"{Path(video_path).stem}_f{frame_idx}", box)
                 )
                 tracking_data[frame_idx]["box"] = box
                 tracking_data[frame_idx]["conf"] = 1.0
                 tracking_data[frame_idx]["status"] = "DETECTED"
-                st.session_state["current_review_idx"] += 1
+                
+                adv_count = 1
+                
+                # 2. 自動追蹤後續相連幀 (Template Matching)
+                orig_bgr = frame_bgr
+                tx1 = max(0, int(box["x"]))
+                ty1 = max(0, int(box["y"]))
+                tx2 = min(orig_w, int(box["x"] + box["w"]))
+                ty2 = min(orig_h, int(box["y"] + box["h"]))
+                template = orig_bgr[ty1:ty2, tx1:tx2]
+                prev_x, prev_y = int(box["x"]), int(box["y"])
+                
+                if template.size > 0:
+                    for k in range(idx + 1, len(review_frames)):
+                        if review_frames[k] == review_frames[k-1] + 1:
+                            next_fi = review_frames[k]
+                            next_frm = tracking_data[next_fi]["frame"]
+                            if next_frm is None:
+                                break
+                                
+                            # 在上一幀球的附近 150x150 範圍內尋找
+                            search_margin = int(150 / scale)
+                            sx1 = max(0, prev_x - search_margin)
+                            sy1 = max(0, prev_y - search_margin)
+                            sx2 = min(orig_w, prev_x + int(box["w"]) + search_margin)
+                            sy2 = min(orig_h, prev_y + int(box["h"]) + search_margin)
+                            
+                            search_area = next_frm[sy1:sy2, sx1:sx2]
+                            if search_area.shape[0] < template.shape[0] or search_area.shape[1] < template.shape[1]:
+                                break
+                                
+                            # 進行特徵比對
+                            res = cv2.matchTemplate(search_area, template, cv2.TM_CCOEFF_NORMED)
+                            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+                            
+                            if max_val > 0.55:  # 相似度閾值 (0.55 對快節奏球類已算穩健)
+                                hit_x = sx1 + max_loc[0]
+                                hit_y = sy1 + max_loc[1]
+                                new_box = {"x": hit_x, "y": hit_y, "w": box["w"], "h": box["h"]}
+                                
+                                st.session_state["pending_annotations"].append(
+                                    (next_frm, f"{Path(video_path).stem}_f{next_fi}", new_box)
+                                )
+                                tracking_data[next_fi]["box"] = new_box
+                                tracking_data[next_fi]["conf"] = float(max_val)
+                                tracking_data[next_fi]["status"] = "DETECTED"
+                                
+                                adv_count += 1
+                                prev_x, prev_y = hit_x, hit_y
+                                # 更新模板以適應球的形變與光影改變
+                                template = next_frm[hit_y:hit_y+int(box["h"]), hit_x:hit_x+int(box["w"])]
+                            else:
+                                break # 追蹤失敗，中斷讓使用者針對這張再次點擊
+                        else:
+                            break # 不連號（代表中間本來就有抓到），跳出
+                            
+                st.session_state["current_review_idx"] += adv_count
                 st.rerun()
         else:
             st.warning("此幀無影像資料")
