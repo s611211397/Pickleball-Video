@@ -70,8 +70,12 @@ class BallTracker:
         self.high_conf_thresh = high_conf_thresh
         
         self.model = _get_model(model_path, self.device, self.use_half)
+        self.is_trt = str(model_path).endswith(".engine") or \
+                      any(Path(model_path).with_suffix(".engine") == p
+                          for p in [Path(model_path).with_name(
+                              Path(model_path).stem + f"_imgsz{INFER_SIZE}_fp16.engine")])
         
-        device_label = f"GPU (CUDA) - TRT={str(self.model.model).endswith('.engine')}" \
+        device_label = f"GPU (CUDA) - {'TRT ✅' if self.is_trt else 'PyTorch'}" \
                         if self.device == 0 else "CPU"
         logger.info(f"BallTracker 使用裝置: {device_label}")
         print(f"🚀 BallTracker 使用裝置: {device_label}")
@@ -182,6 +186,9 @@ def analyze_video_with_yolo(
 
     tracker = BallTracker(model_path=model_name, conf_thresh=conf_thresh, high_conf_thresh=high_conf_thresh)
 
+    # TRT 引擎有 ultralytics batch 推論 bug，改為逐幀送入（TRT 本身速度仍遠快於 PyTorch）
+    effective_batch = 1 if tracker.is_trt else batch_size
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return [], []
@@ -197,7 +204,7 @@ def analyze_video_with_yolo(
         infer_areas        = []   # 只送 YOLO 的 ROI 裁切幀
         infer_local_idx    = []   # 這些幀在 batch 內的位置
 
-        for i in range(batch_size):
+        for i in range(effective_batch):
             try:
                 ret, frame = cap.read()
                 if not ret:
@@ -216,21 +223,22 @@ def analyze_video_with_yolo(
         if not batch_frames:
             break
 
-        # ── 2. 批次 YOLO 推論 ────────────────────────────────────
+        # ── 2. YOLO 推論（逐幀，幀跳躍已提供主要加速）──────────────
         yolo_result_map = {}
         if infer_areas:
-            batch_results = tracker.model.predict(
-                infer_areas,
-                imgsz=INFER_SIZE,
-                classes=[32],
-                verbose=False,
-                device=tracker.device,
-                half=tracker.use_half,
-            )
             _, rx, ry = _crop_roi(batch_frames[0], roi)
-            for local_i, result in zip(infer_local_idx, batch_results):
-                best_box, best_conf = _extract_best_box(result, rx, ry)
+            for local_i, area in zip(infer_local_idx, infer_areas):
+                res = tracker.model.predict(
+                    area,
+                    imgsz=INFER_SIZE,
+                    classes=[32],
+                    verbose=False,
+                    device=tracker.device,
+                    half=tracker.use_half,
+                )
+                best_box, best_conf = _extract_best_box(res[0], rx, ry)
                 yolo_result_map[local_i] = (best_box, best_conf)
+
 
         # ── 3. 逐幀套 Kalman，記錄結果 ───────────────────────────
         for i, frame in enumerate(batch_frames):
