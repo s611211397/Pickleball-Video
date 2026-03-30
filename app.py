@@ -451,82 +451,183 @@ if st.button("🚀 開始分析", type="primary", use_container_width=True):
     st.rerun()
 
 # ─────────────────────────────────────────────
-# Step 2.5: YOLO 軌跡審核 (Active Learning)
+# Step 2.5: YOLO 軌跡審核 (快速翻頁模式)
 # ─────────────────────────────────────────────
+GRID_PAGE_SIZE = 12  # 保留，供未來用
+
 if "review_frames" in st.session_state and "current_review_idx" in st.session_state:
     review_frames = st.session_state["review_frames"]
     tracking_data = st.session_state["tracking_data"]
     idx = st.session_state["current_review_idx"]
-    
+
     if len(review_frames) > 0 and idx < len(review_frames):
-        st.header("🧐 Step 2.5: 軌跡迷失審核 (主動學習標註)")
+        st.header("🧐 Step 2.5: 軌跡迷失審核")
+
         frame_idx = review_frames[idx]
         data = tracking_data[frame_idx]
-        
-        st.write(f"正在審核第 **{idx+1} / {len(review_frames)}** 張相鄰疑似斷軌影像 (Frame: {frame_idx})")
-        st.caption("請在下方畫面上，直接點擊「球的確實位置」。如果這張圖球已經飛出場外或被擋死，點選右側「這張圖沒球」。")
-        
         frame_bgr = data["frame"]
+
+        # 進度列 + 右側儲存按鈕
+        prog_col, save_col = st.columns([4, 1])
+        with prog_col:
+            st.progress(idx / len(review_frames),
+                        text=f"第 {idx + 1} / {len(review_frames)} 張 (Frame {frame_idx})")
+        with save_col:
+            if st.button("💾 儲存並結束", use_container_width=True):
+                st.session_state["current_review_idx"] = len(review_frames)
+                # 不需要 st.rerun()，自然刷新即可
+
+        # 顯示大圖（可點擊標記球的位置）
         if frame_bgr is not None:
-            # ROI crop if desired or full frame? Full frame is better for labeling.
+            h, w = frame_bgr.shape[:2]
+            if w > 960:
+                scale = 960 / w
+                frame_bgr = cv2.resize(frame_bgr, (960, int(h * scale)))
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            
-            c1, c2 = st.columns([3, 1])
-            with c1:
-                # 取得點擊座標
-                click_val = streamlit_image_coordinates(Image.fromarray(frame_rgb), key=f"review_{idx}")
-                
-            with c2:
-                if click_val is not None:
-                    # 不立刻存檔，先放在記憶體
-                    box = {"x": click_val["x"] - 10, "y": click_val["y"] - 10, "w": 20, "h": 20}
-                    st.session_state["pending_annotations"].append(
-                        (frame_bgr, f"{Path(video_path).stem}_f{frame_idx}", box)
-                    )
-                    
-                    # 覆蓋 tracking data 修正
-                    tracking_data[frame_idx]["box"] = box
-                    tracking_data[frame_idx]["conf"] = 1.0 
-                    tracking_data[frame_idx]["status"] = "DETECTED"
-                    
-                    st.session_state["current_review_idx"] += 1
-                    st.rerun()
-                    
-                if st.button("沒有球 / 飛出界外", use_container_width=True):
-                    st.session_state["pending_annotations"].append(
-                        (frame_bgr, f"{Path(video_path).stem}_f{frame_idx}", None)
-                    )
-                    st.session_state["current_review_idx"] += 1
-                    st.rerun()
+            st.caption("👆 **直接點擊球的位置** 來標記座標，或使用下方按鈕快速操作")
+            click_val = streamlit_image_coordinates(Image.fromarray(frame_rgb), key=f"review_{idx}")
+            if click_val is not None:
+                box = {"x": click_val["x"] - 10, "y": click_val["y"] - 10, "w": 20, "h": 20}
+                st.session_state["pending_annotations"].append(
+                    (data["frame"], f"{Path(video_path).stem}_f{frame_idx}", box)
+                )
+                tracking_data[frame_idx]["box"] = box
+                tracking_data[frame_idx]["conf"] = 1.0
+                tracking_data[frame_idx]["status"] = "DETECTED"
+                st.session_state["current_review_idx"] += 1
+        else:
+            st.warning("此幀無影像資料")
 
-                if st.button("這張及後續「連續鏡頭」皆無球", use_container_width=True, type="primary"):
-                    consecutive_count = 1
-                    for k in range(idx + 1, len(review_frames)):
-                        if review_frames[k] == review_frames[k-1] + 1:
-                            consecutive_count += 1
-                        else:
-                            break
-                    for k_offset in range(consecutive_count):
-                        f_idx = review_frames[idx + k_offset]
-                        frm_bgr = tracking_data[f_idx]["frame"]
+
+        # 操作按鈕 — 大塊並排，不呼叫 st.rerun()
+        b1, b2, b3, b4 = st.columns(4)
+        with b1:
+            if st.button("✅ 有球（略過）", use_container_width=True):
+                st.session_state["current_review_idx"] += 1
+        with b2:
+            if st.button("❌ 無球", use_container_width=True, type="primary"):
+                st.session_state["pending_annotations"].append(
+                    (data["frame"], f"{Path(video_path).stem}_f{frame_idx}", None)
+                )
+                st.session_state["current_review_idx"] += 1
+        with b3:
+            # 計算後續連號幀數，一次標記
+            if st.button("❌❌ 連續無球", use_container_width=True, type="primary"):
+                count = 1
+                for k in range(idx + 1, len(review_frames)):
+                    if review_frames[k] == review_frames[k - 1] + 1:
+                        count += 1
+                    else:
+                        break
+                for k_off in range(count):
+                    fi = review_frames[idx + k_off]
+                    st.session_state["pending_annotations"].append(
+                        (tracking_data[fi]["frame"], f"{Path(video_path).stem}_f{fi}", None)
+                    )
+                st.session_state["current_review_idx"] += count
+        with b4:
+            if st.button("⏭ 略過", use_container_width=True):
+                st.session_state["current_review_idx"] += 1
+
+        st.stop()
+
+    elif len(review_frames) > 0 and idx >= len(review_frames):
+        if "pending_annotations" in st.session_state and len(st.session_state["pending_annotations"]) > 0:
+            with st.spinner("💾 正在將標記寫入硬碟中，請稍候..."):
+                dm = DatasetManager()
+                for frm, name, box in st.session_state["pending_annotations"]:
+                    dm.save_annotation(frm, name, box)
+            st.session_state["pending_annotations"] = []
+        st.success("✅ 問題軌跡審核告一段落，已存入 dataset 供日後訓練使用！")
+
+
+
+if "review_frames" in st.session_state and "current_review_idx" in st.session_state:
+    review_frames = st.session_state["review_frames"]
+    tracking_data = st.session_state["tracking_data"]
+    idx = st.session_state["current_review_idx"]
+
+    if len(review_frames) > 0 and idx < len(review_frames):
+        st.header("🧐 Step 2.5: 軌跡迷失審核 (批量審核模式)")
+
+        # 計算目前頁面
+        page_start = idx
+        page_end   = min(idx + GRID_PAGE_SIZE, len(review_frames))
+        page_frames = review_frames[page_start:page_end]
+
+        # 進度提示
+        col_prog, col_save = st.columns([3, 1])
+        with col_prog:
+            st.caption(
+                f"📄 第 **{idx + 1} ~ {page_end}** 張 / 共 **{len(review_frames)}** 張"
+                f"　｜　⏳ 每頁 {GRID_PAGE_SIZE} 張，點好後按「下一頁」"
+            )
+        with col_save:
+            if st.button("💾 儲存並結束標註", use_container_width=True, type="primary"):
+                st.session_state["current_review_idx"] = len(review_frames)
+                st.rerun()
+
+        st.divider()
+
+        # ── 網格顯示 ─────────────────────────────────────────────
+        grid_cols = st.columns(4)
+        for i, frame_idx in enumerate(page_frames):
+            data = tracking_data[frame_idx]
+            frame_bgr = data["frame"]
+            marked_key = f"marked_{frame_idx}"
+
+            with grid_cols[i % 4]:
+                # 已標記的顯示狀態角標
+                already = st.session_state.get(marked_key)
+                if already == "無球":
+                    st.markdown("🔴 **無球**")
+                elif already == "略過":
+                    st.markdown("⬜ **略過**")
+                else:
+                    st.markdown("❓ *未標記*")
+
+                if frame_bgr is not None:
+                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    # 顯示縮圖（不需要點擊座標，只要設定有球/無球）
+                    st.image(Image.fromarray(frame_rgb), caption=f"Frame {frame_idx}", use_container_width=True)
+                else:
+                    st.warning("無影像資料")
+
+                b1, b2 = st.columns(2)
+                with b1:
+                    if st.button("無球", key=f"noball_{frame_idx}", use_container_width=True):
                         st.session_state["pending_annotations"].append(
-                            (frm_bgr, f"{Path(video_path).stem}_f{f_idx}", None)
+                            (frame_bgr, f"{Path(video_path).stem}_f{frame_idx}", None)
                         )
-                    st.session_state["current_review_idx"] += consecutive_count
-                    st.rerun()
-                    
-                if st.button("略過此張圖", use_container_width=True):
-                    st.session_state["current_review_idx"] += 1
-                    st.rerun()
+                        st.session_state[marked_key] = "無球"
+                        # 不 rerun 讓使用者繼續點其他格
+                with b2:
+                    if st.button("略過", key=f"skip_{frame_idx}", use_container_width=True):
+                        st.session_state[marked_key] = "略過"
 
-                st.divider()
+        st.divider()
 
-                if st.button("💾 儲存已標註內容並進入下一步", use_container_width=True):
-                    # 把 index 推向結尾，這樣會直接進到底下的 elif 區塊存檔
-                    st.session_state["current_review_idx"] = len(review_frames)
-                    st.rerun()
-        
-        st.stop() # 阻擋後續顯示，強制先標註完
+        # ── 頁面導航 ─────────────────────────────────────────────
+        nav1, nav2, nav3 = st.columns([1, 2, 1])
+        with nav1:
+            if st.button("⏮ 這頁全部標「無球」", use_container_width=True):
+                for frame_idx in page_frames:
+                    frm_bgr = tracking_data[frame_idx]["frame"]
+                    st.session_state["pending_annotations"].append(
+                        (frm_bgr, f"{Path(video_path).stem}_f{frame_idx}", None)
+                    )
+                    st.session_state[f"marked_{frame_idx}"] = "無球"
+                st.session_state["current_review_idx"] += len(page_frames)
+                st.rerun()
+        with nav2:
+            st.progress((idx) / len(review_frames), text="標註進度")
+        with nav3:
+            if st.button("下一頁 ▶", use_container_width=True, type="primary"):
+                st.session_state["current_review_idx"] += len(page_frames)
+                st.rerun()
+
+        st.stop()
+
     elif len(review_frames) > 0 and idx >= len(review_frames):
         # 全部批次寫入資料夾
         if "pending_annotations" in st.session_state and len(st.session_state["pending_annotations"]) > 0:
@@ -535,11 +636,13 @@ if "review_frames" in st.session_state and "current_review_idx" in st.session_st
                 for frm, name, box in st.session_state["pending_annotations"]:
                     dm.save_annotation(frm, name, box)
             st.session_state["pending_annotations"] = []
-            
+
         st.success("✅ 問題軌跡審核告一段落，已存入 dataset 供日後訓練使用！")
+
 
 # ─────────────────────────────────────────────
 # Step 3: 結果展示
+
 # ─────────────────────────────────────────────
 if "segments" in st.session_state:
     segments: list[Segment] = st.session_state["segments"]
