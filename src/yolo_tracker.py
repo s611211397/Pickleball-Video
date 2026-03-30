@@ -1,4 +1,4 @@
-"""YOLO 物件追蹤與分析模組"""
+"""YOLO 物件追蹤與分析模組 (GPU 最佳化版本)"""
 
 import cv2
 import numpy as np
@@ -10,282 +10,266 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# ─── 全域常數 ──────────────────────────────────────────────
+INFER_SIZE = 320   # YOLO 推論解析度 (降低此值可加速，320 是速度/精度最佳平衡)
+INFER_EVERY = 3    # 每幾幀才跑一次 YOLO（中間幀用 Kalman 預測填補）
+BATCH_SIZE  = 16   # 每批次一起送進 YOLO 的幀數 (太大可能爆 VRAM，RTX 2070 8GB 可用 16~32)
+
+
+# ─── TensorRT 自動匯出與載入 ─────────────────────────────────
+def _get_model(pt_path: str, device: int | str, use_half: bool) -> YOLO:
+    """
+    嘗試載入 TensorRT Engine (.engine)；若不存在則自動從 .pt 匯出（只需一次）。
+    匯出失敗時（如未安裝 TensorRT）優雅降級，直接回傳原始 PyTorch 模型。
+    """
+    engine_path = Path(pt_path).with_suffix("") \
+        .with_name(Path(pt_path).stem + f"_imgsz{INFER_SIZE}_fp16.engine")
+    
+    # 優先使用已存在的 TensorRT Engine
+    if engine_path.exists():
+        logger.info(f"✅ 載入 TensorRT Engine: {engine_path}")
+        return YOLO(str(engine_path))
+    
+    # 嘗試自動匯出 (只在有 GPU 時才做)
+    if device != "cpu":
+        try:
+            logger.info(f"🔧 首次執行：正在將模型轉換成 TensorRT Engine，這大約需要 2~5 分鐘，之後每次啟動都無需重複…")
+            print("🔧 首次執行：正在將模型轉換成 TensorRT Engine，這大約需要 2~5 分鐘，之後每次啟動都無需重複…")
+            base_model = YOLO(pt_path)
+            base_model.export(
+                format="engine",
+                imgsz=INFER_SIZE,
+                half=use_half,
+                device=device,
+            )
+            # ultralytics 預設會在同目錄下產生同名 .engine
+            default_engine = Path(pt_path).with_suffix(".engine")
+            if default_engine.exists():
+                default_engine.rename(engine_path)
+            if engine_path.exists():
+                logger.info(f"✅ TensorRT Engine 匯出成功，已儲存到: {engine_path}")
+                print(f"✅ TensorRT Engine 匯出成功！之後都會直接使用加速版本。")
+                return YOLO(str(engine_path))
+        except Exception as e:
+            logger.warning(f"⚠️ TensorRT 匯出失敗 ({e})，退回使用 PyTorch 模型。")
+            print(f"⚠️ TensorRT 匯出失敗 ({e})，退回使用 PyTorch 模型。")
+    
+    # 降級：直接回傳 PyTorch 模型
+    model = YOLO(pt_path)
+    model.to(device)
+    return model
+
+
+# ─── 球追蹤器 ────────────────────────────────────────────────
 class BallTracker:
     def __init__(self, model_path: str = "yolov8n.pt", conf_thresh: float = 0.2, high_conf_thresh: float = 0.5):
-        self.device = 0 if torch.cuda.is_available() else "cpu"
+        self.device   = 0 if torch.cuda.is_available() else "cpu"
         self.use_half = torch.cuda.is_available()
-        self.model = YOLO(model_path)
-        self.model.to(self.device)
-        logger.info(f"BallTracker 使用裝置: {'GPU (CUDA)' if self.device == 0 else 'CPU'}")
-        self.conf_thresh = conf_thresh
+        self.conf_thresh      = conf_thresh
         self.high_conf_thresh = high_conf_thresh
         
+        self.model = _get_model(model_path, self.device, self.use_half)
+        
+        device_label = f"GPU (CUDA) - TRT={str(self.model.model).endswith('.engine')}" \
+                        if self.device == 0 else "CPU"
+        logger.info(f"BallTracker 使用裝置: {device_label}")
+        print(f"🚀 BallTracker 使用裝置: {device_label}")
+        
         self.reset_tracker()
-        
+
     def reset_tracker(self):
-        """重置追蹤器狀態 (Kalman Filter)"""
-        # 狀態矩陣 [x, y, dx, dy] -> 中心座標與速度
+        """重置 Kalman Filter 狀態"""
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
-        
-        # 狀態轉移矩陣 (恆定速度模型)
-        dt = 1.0 # 時間步長
+        dt = 1.0
         self.kf.F = np.array([
             [1, 0, dt, 0],
             [0, 1, 0, dt],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
+            [0, 0, 1,  0],
+            [0, 0, 0,  1],
         ])
-        
-        # 測量矩陣 (我們只測量 x, y)
-        self.kf.H = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0]
-        ])
-        
-        # 不確定性矩陣
+        self.kf.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]])
         self.kf.P *= 1000.0
-        # 測量雜訊 (假設視覺測量有時候會飄移)
-        self.kf.R = np.array([
-            [10, 0],
-            [0, 10]
-        ])
-        # 過程雜訊 (球受空氣阻力、重力改變速度)
+        self.kf.R = np.array([[10, 0], [0, 10]])
         self.kf.Q *= 0.1
-        
-        self.is_tracking = False
+        self.is_tracking   = False
         self.missed_frames = 0
-        self.max_missed_frames = 15 # 若速度快，0.5秒差不多 15幀
-        
-    def track(self, frame, roi=None):
-        """
-        在給定的畫面中尋找球並更新軌跡狀態。
-        
-        Returns:
-            ball_pos: {x, y, w, h} 或是 None
-            conf: 預測信心度
-            status: "DETECTED" | "PREDICTED" | "LOST"
-        """
-        # YOLO 預測 (只抓 sports ball, class 32 in COCO)
-        if roi:
-            x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
-            search_area = frame[y:y+h, x:x+w].copy()
+        self.max_missed_frames = 15
 
-            # 若有提供多邊形頂點，且頂點數量大於 2，則繪製遮罩
-            if "points" in roi and len(roi["points"]) >= 3:
-                mask = np.zeros(search_area.shape[:2], dtype=np.uint8)
-                
-                # 計算相對座標點
-                pts = np.array([[[p["x"] - x, p["y"] - y] for p in roi["points"]]], dtype=np.int32)
-                cv2.fillPoly(mask, pts, 255)
-                
-                # 保留多邊形內的像素，多邊形外塗黑
-                search_area = cv2.bitwise_and(search_area, search_area, mask=mask)
 
-        else:
-            search_area = frame
-            x, y = 0, 0
-            
-        results = self.model.predict(
-            search_area, 
-            classes=[32], 
-            verbose=False, 
-            device=self.device,
-            half=self.use_half
-        )
-        
-        best_box = None
-        best_conf = 0.0
-        
-        if len(results) > 0 and len(results[0].boxes) > 0:
-            for box in results[0].boxes:
-                conf = float(box.conf[0])
-                if conf > best_conf:
-                    best_conf = conf
-                    bx, by, bw, bh = box.xywh[0].cpu().numpy()
-                    best_box = {
-                        "x": int(bx - bw/2) + x,
-                        "y": int(by - bh/2) + y,
-                        "w": int(bw),
-                        "h": int(bh)
-                    }
-                    
-        # Kalman Filter 邏輯
-        self.kf.predict()
-        
-        if best_box and best_conf >= self.conf_thresh:
-            # 觀測更新
-            cx = best_box["x"] + best_box["w"]/2
-            cy = best_box["y"] + best_box["h"]/2
-            
-            if not self.is_tracking:
-                self.kf.x = np.array([cx, cy, 0, 0]).reshape(4, 1)
-                self.is_tracking = True
-            else:
-                self.kf.update(np.array([cx, cy]).reshape(2, 1))
-                
-            self.missed_frames = 0
-            return best_box, best_conf, "DETECTED"
-            
-        else:
-            self.missed_frames += 1
-            if self.is_tracking and self.missed_frames <= self.max_missed_frames:
-                # 盲測階段
-                pred_x = int(self.kf.x[0, 0])
-                pred_y = int(self.kf.x[1, 0])
-                pred_w = 20 # 假設固定大小
-                pred_h = 20
-                
-                pred_box = {
-                    "x": pred_x - pred_w//2,
-                    "y": pred_y - pred_h//2,
-                    "w": pred_w,
-                    "h": pred_h
+# ─── 輔助：裁切 ROI 區域 ──────────────────────────────────────
+def _crop_roi(frame: np.ndarray, roi: dict | None):
+    """回傳 (裁切區域, rx, ry)"""
+    if roi:
+        rx, ry = roi["x"], roi["y"]
+        rw, rh = roi["w"], roi["h"]
+        area = frame[ry:ry+rh, rx:rx+rw].copy()
+        if "points" in roi and len(roi["points"]) >= 3:
+            mask = np.zeros(area.shape[:2], dtype=np.uint8)
+            pts = np.array([[[p["x"] - rx, p["y"] - ry] for p in roi["points"]]], dtype=np.int32)
+            cv2.fillPoly(mask, pts, 255)
+            area = cv2.bitwise_and(area, area, mask=mask)
+        return area, rx, ry
+    return frame, 0, 0
+
+
+def _extract_best_box(result, rx: int, ry: int):
+    """從 YOLO 結果取出信心最高的 bounding box (附加 ROI 偏移)"""
+    best_box, best_conf = None, 0.0
+    if len(result.boxes) > 0:
+        for box in result.boxes:
+            c = float(box.conf[0])
+            if c > best_conf:
+                best_conf = c
+                bx, by, bw, bh = box.xywh[0].cpu().numpy()
+                best_box = {
+                    "x": int(bx - bw / 2) + rx,
+                    "y": int(by - bh / 2) + ry,
+                    "w": int(bw),
+                    "h": int(bh),
                 }
-                return pred_box, best_conf, "PREDICTED"
-            else:
-                self.is_tracking = False
-                return None, 0.0, "LOST"
+    return best_box, best_conf
 
-def analyze_video_with_yolo(video_path, roi, conf_thresh=0.2, high_conf_thresh=0.5, progress_callback=None, batch_size=16):
+
+def _kalman_step(tracker: BallTracker, best_box, best_conf):
+    """執行一步 Kalman 更新，回傳 (box_out, conf_out, status)"""
+    tracker.kf.predict()
+
+    if best_box and best_conf >= tracker.conf_thresh:
+        cx = best_box["x"] + best_box["w"] / 2
+        cy = best_box["y"] + best_box["h"] / 2
+        if not tracker.is_tracking:
+            tracker.kf.x = np.array([cx, cy, 0, 0]).reshape(4, 1)
+            tracker.is_tracking = True
+        else:
+            tracker.kf.update(np.array([cx, cy]).reshape(2, 1))
+        tracker.missed_frames = 0
+        return best_box, best_conf, "DETECTED"
+    else:
+        tracker.missed_frames += 1
+        if tracker.is_tracking and tracker.missed_frames <= tracker.max_missed_frames:
+            px = int(tracker.kf.x[0, 0])
+            py = int(tracker.kf.x[1, 0])
+            return {"x": px - 10, "y": py - 10, "w": 20, "h": 20}, best_conf, "PREDICTED"
+        else:
+            tracker.is_tracking = False
+            return None, 0.0, "LOST"
+
+
+# ─── 主分析函式 ───────────────────────────────────────────────
+def analyze_video_with_yolo(
+    video_path,
+    roi,
+    conf_thresh=0.2,
+    high_conf_thresh=0.5,
+    progress_callback=None,
+    batch_size: int = BATCH_SIZE,
+    infer_every: int = INFER_EVERY,
+):
+    """
+    批次 + 跳幀推論主流程：
+      - 每 infer_every 幀才送一次 YOLO，中間幀用 Kalman 填補。
+      - 每批次 batch_size 幀同時送進 GPU 做批次加速。
+      - 若有 TensorRT Engine 則自動使用。
+    """
     model_name = "yolov8n.pt"
-    
-    # 若有客製化的備份模型則優先使用
     custom_model_backup = Path("models/pickleball_best.pt")
-    custom_model_local = Path("dataset/runs/train/weights/best.pt")
-    
+    custom_model_local  = Path("dataset/runs/train/weights/best.pt")
     if custom_model_backup.exists():
         model_name = str(custom_model_backup)
     elif custom_model_local.exists():
         model_name = str(custom_model_local)
-        
+
     tracker = BallTracker(model_path=model_name, conf_thresh=conf_thresh, high_conf_thresh=high_conf_thresh)
-    
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return [], []
-        
+
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    
-    # 預先裁切 ROI 的偏移量
-    if roi:
-        rx, ry, rw, rh = roi["x"], roi["y"], roi["w"], roi["h"]
-    else:
-        rx, ry = 0, 0
-    
-    tracking_data = []
-    review_frames = []
-    frame_idx = 0
-    
+    fps          = cap.get(cv2.CAP_PROP_FPS)
+    tracking_data, review_frames = [], []
+    absolute_frame_idx = 0
+
     while True:
-        # ── 讀進一批幀 ──────────────────────────
-        batch_frames = []   # 原始 BGR 完整幀
-        batch_areas = []    # 裁切後送 YOLO 的區塊
-        
-        for _ in range(batch_size):
+        # ── 1. 讀進一批幀，同時建立送 YOLO 的子集 ──────────────
+        batch_frames       = []   # 所有幀
+        infer_areas        = []   # 只送 YOLO 的 ROI 裁切幀
+        infer_local_idx    = []   # 這些幀在 batch 內的位置
+
+        for i in range(batch_size):
             try:
                 ret, frame = cap.read()
                 if not ret:
                     break
             except Exception as e:
-                print(f"警告：讀取第 {frame_idx + len(batch_frames)} 幀時發生錯誤 ({e})，停止讀取後續影格。")
+                print(f"警告：讀取第 {absolute_frame_idx + i} 幀時發生錯誤 ({e})")
                 break
-            
+
             batch_frames.append(frame)
-            
-            if roi:
-                area = frame[ry:ry+rh, rx:rx+rw].copy()
-                # 多邊形遮罩
-                if "points" in roi and len(roi["points"]) >= 3:
-                    mask = np.zeros(area.shape[:2], dtype=np.uint8)
-                    pts = np.array([[[p["x"] - rx, p["y"] - ry] for p in roi["points"]]], dtype=np.int32)
-                    cv2.fillPoly(mask, pts, 255)
-                    area = cv2.bitwise_and(area, area, mask=mask)
-            else:
-                area = frame
-            batch_areas.append(area)
-        
+            # 每隔 infer_every 幀才做 YOLO 推論
+            if (absolute_frame_idx + i) % infer_every == 0:
+                area, _, _ = _crop_roi(frame, roi)
+                infer_areas.append(area)
+                infer_local_idx.append(i)
+
         if not batch_frames:
             break
-        
-        # ── 一次性批次送進 YOLO ──────────────────
-        batch_results = tracker.model.predict(
-            batch_areas,
-            classes=[32],
-            verbose=False,
-            device=tracker.device,
-            half=tracker.use_half,
-        )
-        
-        # ── 逐幀套用 Kalman Filter 並記錄結果 ────
-        for i, (frame, result) in enumerate(zip(batch_frames, batch_results)):
-            cur_idx = frame_idx + i
-            
-            # 找這幀最高信心的框
-            best_box = None
-            best_conf = 0.0
-            if len(result.boxes) > 0:
-                for box in result.boxes:
-                    c = float(box.conf[0])
-                    if c > best_conf:
-                        best_conf = c
-                        bx, by, bw, bh = box.xywh[0].cpu().numpy()
-                        best_box = {
-                            "x": int(bx - bw/2) + rx,
-                            "y": int(by - bh/2) + ry,
-                            "w": int(bw),
-                            "h": int(bh),
-                        }
-            
-            # Kalman Filter 更新
-            tracker.kf.predict()
-            if best_box and best_conf >= tracker.conf_thresh:
-                cx = best_box["x"] + best_box["w"] / 2
-                cy = best_box["y"] + best_box["h"] / 2
-                if not tracker.is_tracking:
-                    tracker.kf.x = np.array([cx, cy, 0, 0]).reshape(4, 1)
-                    tracker.is_tracking = True
-                else:
-                    tracker.kf.update(np.array([cx, cy]).reshape(2, 1))
-                tracker.missed_frames = 0
-                status = "DETECTED"
-                box_out = best_box
-                conf_out = best_conf
+
+        # ── 2. 批次 YOLO 推論 ────────────────────────────────────
+        yolo_result_map = {}
+        if infer_areas:
+            batch_results = tracker.model.predict(
+                infer_areas,
+                imgsz=INFER_SIZE,
+                classes=[32],
+                verbose=False,
+                device=tracker.device,
+                half=tracker.use_half,
+            )
+            _, rx, ry = _crop_roi(batch_frames[0], roi)
+            for local_i, result in zip(infer_local_idx, batch_results):
+                best_box, best_conf = _extract_best_box(result, rx, ry)
+                yolo_result_map[local_i] = (best_box, best_conf)
+
+        # ── 3. 逐幀套 Kalman，記錄結果 ───────────────────────────
+        for i, frame in enumerate(batch_frames):
+            cur_idx = absolute_frame_idx + i
+
+            if i in yolo_result_map:
+                # 這幀有跑 YOLO
+                best_box, best_conf = yolo_result_map[i]
             else:
-                tracker.missed_frames += 1
-                if tracker.is_tracking and tracker.missed_frames <= tracker.max_missed_frames:
-                    pred_x = int(tracker.kf.x[0, 0])
-                    pred_y = int(tracker.kf.x[1, 0])
-                    box_out = {"x": pred_x - 10, "y": pred_y - 10, "w": 20, "h": 20}
-                    conf_out = best_conf
-                    status = "PREDICTED"
-                else:
-                    tracker.is_tracking = False
-                    box_out = None
-                    conf_out = 0.0
-                    status = "LOST"
-            
-            save_frame = frame.copy() if status == "PREDICTED" or (0.01 <= conf_out < high_conf_thresh) else None
+                # 跳過的幀：不餵新觀測，讓 Kalman 自行預測
+                best_box, best_conf = None, 0.0
+
+            box_out, conf_out, status = _kalman_step(tracker, best_box, best_conf)
+
+            save_frame = frame.copy() \
+                if status == "PREDICTED" or (0.01 <= conf_out < high_conf_thresh) \
+                else None
+
             tracking_data.append({
                 "frame_idx": cur_idx,
-                "time": cur_idx / fps if fps > 0 else 0,
-                "box": box_out,
-                "conf": conf_out,
+                "time":  cur_idx / fps if fps > 0 else 0,
+                "box":   box_out,
+                "conf":  conf_out,
                 "status": status,
                 "frame": save_frame,
             })
-            
+
             if status == "PREDICTED" or (0.01 <= conf_out < high_conf_thresh):
                 review_frames.append(cur_idx)
-        
-        frame_idx += len(batch_frames)
-        
-        if progress_callback and frame_idx % (batch_size * 2) == 0:
-            progress_callback(frame_idx / total_frames, f"YOLO 批次追蹤中 ({frame_idx}/{total_frames})")
-        
-        # 如果這批幀數不足 batch_size，代表影片已結束
+
+        absolute_frame_idx += len(batch_frames)
+
+        if progress_callback and absolute_frame_idx % (batch_size * 2) == 0:
+            progress_callback(
+                absolute_frame_idx / total_frames,
+                f"YOLO 批次追蹤中 ({absolute_frame_idx}/{total_frames})，推論幀率 1/{infer_every}"
+            )
+
         if len(batch_frames) < batch_size:
             break
-            
+
     cap.release()
     return tracking_data, review_frames
