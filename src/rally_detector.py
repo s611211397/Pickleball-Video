@@ -1,7 +1,9 @@
-"""融合判斷引擎 — 結合視覺與音訊偵測 rally 起止點"""
+"""融合判斷引擎 2.0 — 物理軌跡與影音交軌語意裁判系統"""
 
 import bisect
+import numpy as np
 from dataclasses import dataclass
+from scipy.signal import find_peaks, savgol_filter
 
 
 @dataclass
@@ -19,131 +21,152 @@ def detect_rallies(
     motion_timeline: list[dict],
     hit_times: list[float] | None = None,
     tracking_data: list[dict] | None = None,
-    gap_threshold: float = 4.0,
+    gap_threshold: float = 4.0,       # 仍作為無資料的斷點兜底
     min_duration: float = 3.0,
-    activity_threshold: float = 0.3,
-    motion_weight: float = 0.7,
-    audio_weight: float = 0.3,
-    motion_threshold: float = 0.08,
+    **kwargs
 ) -> list[Segment]:
-    """偵測所有 rally 區段。
-
-    Args:
-        motion_timeline: 視覺動態時序 [{"time", "score"}, ...]
-        hit_times: 擊球時間點列表（可為 None，純視覺模式）
-        gap_threshold: 無活動間隔門檻 (秒)
-        min_duration: 最短 rally 時長 (秒)
-        activity_threshold: 綜合活動分數門檻
-        motion_weight: 視覺權重
-        audio_weight: 音訊權重
-        motion_threshold: 視覺動態門檻
-
-    Returns:
-        rally 區段列表
-    """
-    if not motion_timeline:
+    """2.0 版：透過追蹤軌跡與音效交集，判斷真實回合。"""
+    if not tracking_data or len(tracking_data) < 10:
         return []
-
-    # 如果沒有音訊資料，改為純視覺模式
+    
     if hit_times is None:
         hit_times = []
-        motion_weight = 1.0
-        audio_weight = 0.0
 
-    sorted_hits = sorted(hit_times)
-
-    # 計算每個時間點的綜合活動分數
-    active_points = []
-    for idx, point in enumerate(motion_timeline):
-        t = point["time"]
-        motion_score = point["score"]
-
-        # 正規化動態分數：以 motion_threshold 為基準，超過則 clamp 到 1.0
-        normalized_motion = min(motion_score / motion_threshold, 1.0) if motion_threshold > 0 else 0.0
-
-        # 檢查附近是否有擊球聲（±0.5 秒內）
-        has_hit = _has_nearby_hit(t, sorted_hits, window=0.5)
-        audio_score = 1.0 if has_hit else 0.0
-
-        # YOLO 追蹤判斷：如果狀態是偵測到，加強動態分數
-        yolo_boost = 0.0
-        if tracking_data and idx < len(tracking_data):
-            td = tracking_data[idx]
-            if td["status"] in ["DETECTED", "PREDICTED"]:
-                yolo_boost = 1.0  # YOLO 確認球在畫面內
-
-        # 融合加總 (給 YOLO 極高的權重)
-        # 如果 YOLO 有抓到，等同於畫面有大量動態
-        if tracking_data:
-            combined = (0.5 * normalized_motion + 0.5 * yolo_boost) * motion_weight + audio_weight * audio_score
+    # 1. 提取物理軌跡 (取 Bounding Box 底部作為落地基準)
+    times = []
+    xs = []
+    ys = []
+    for td in tracking_data:
+        times.append(td["time"])
+        if td["box"] is not None and td["status"] in ["DETECTED", "PREDICTED"]:
+            xs.append(td["box"]["x"] + td["box"]["w"] / 2.0) # 中心 X
+            ys.append(td["box"]["y"] + td["box"]["h"])       # 底部 Y，適合算彈地
         else:
-            combined = motion_weight * normalized_motion + audio_weight * audio_score
-
-        if combined >= activity_threshold:
-            active_points.append(t)
-
-    if not active_points:
+            xs.append(np.nan)
+            ys.append(np.nan)
+            
+    times = np.array(times)
+    xs = np.array(xs)
+    ys = np.array(ys)
+    
+    # 2. 內插補齊與平滑處理
+    valid_mask = ~np.isnan(ys)
+    if not np.any(valid_mask):
         return []
+    
+    indices = np.arange(len(ys))
+    xs_interp = np.interp(indices, indices[valid_mask], xs[valid_mask])
+    ys_interp = np.interp(indices, indices[valid_mask], ys[valid_mask])
+    
+    # 使用 Savitzky-Golay 濾波器平滑軌跡，去除雜訊抖動，窗格大約 15 幀(0.5秒)
+    window = min(15, len(ys_interp) if len(ys_interp) % 2 == 1 else len(ys_interp) - 1)
+    window = max(3, window)
+    xs_smooth = savgol_filter(xs_interp, window_length=window, polyorder=2)
+    ys_smooth = savgol_filter(ys_interp, window_length=window, polyorder=2)
+    
+    # 3. 尋找「落地點 (Bounce)」
+    # 影像中的 Y 軸朝下，所以球往地上砸再彈起，Y座標會是一個局部的「最大值 (Peak)」
+    # prominence=15 代表這個落地彈跳在畫面上至少有15像素的高度差
+    bounce_idxs, _ = find_peaks(ys_smooth, prominence=15, distance=10)
+    bounce_times = times[bounce_idxs]
 
-    # 根據間隔分群成各段 rally
-    segments = _cluster_into_segments(active_points, gap_threshold)
+    # 4. 尋找「真實擊球點 (True Hits)」
+    # 影音交錯濾網：聲音有響，且畫面中的球正在移動中 (速度非零) 或軌跡有急折
+    true_hits = []
+    dx = np.abs(np.diff(xs_smooth, prepend=xs_smooth[0]))
+    dy = np.abs(np.diff(ys_smooth, prepend=ys_smooth[0]))
+    speed = np.sqrt(dx**2 + dy**2) # 綜合 2D 移動距離
+    
+    for ht in sorted(hit_times):
+        # 尋找對應的影格 index
+        idx = bisect.bisect_left(times, ht)
+        if 0 <= idx < len(times):
+            # 檢查聲音發生時，前後 0.2 秒(約 6 幀) 內，球的狀態
+            search_start = max(0, idx - 6)
+            search_end = min(len(times), idx + 6)
+            
+            # 如果這段期間內球遺失得太嚴重，代表根本沒拍到球，極大機率是隔壁場
+            lost_ratio = np.sum(np.isnan(ys[search_start:search_end])) / (search_end - search_start + 1e-5)
+            if lost_ratio > 0.8:
+                continue
+                
+            # 檢查球速（必須在移動中，避免死球躺在地上的聲音誤判）
+            avg_speed = np.mean(speed[search_start:search_end])
+            if avg_speed > 2.0: # 畫面中每幀綜合移動大於 2 pixel
+                true_hits.append(ht)
 
-    # 過濾太短的 rally（撿球、走動）
-    segments = [seg for seg in segments if seg.duration >= min_duration]
-
-    # 合併相鄰過近的 segments（間隔 < gap_threshold 的一半）
-    segments = _merge_close_segments(segments, min_gap=gap_threshold / 2)
-
-    return segments
-
-
-def _cluster_into_segments(active_points: list[float], gap_threshold: float) -> list[Segment]:
-    """將活動時間點根據間隔分群成段落。"""
+    # 5. 語意裁判引擎 (State Machine)
+    # 規則：以第一個 True Hit 為發球，之後若發生「連續兩次 bounce 中間無 hit」則死球結束
     segments = []
-    seg_start = active_points[0]
-    prev_time = active_points[0]
-
-    for t in active_points[1:]:
-        if t - prev_time > gap_threshold:
-            segments.append(Segment(start=seg_start, end=prev_time))
-            seg_start = t
-        prev_time = t
-
-    # 最後一段
-    segments.append(Segment(start=seg_start, end=prev_time))
-    return segments
-
-
-def _merge_close_segments(segments: list[Segment], min_gap: float) -> list[Segment]:
-    """合併間隔太近的相鄰段落，避免碎片化。"""
-    if len(segments) <= 1:
-        return segments
-
-    merged = [segments[0]]
-    for seg in segments[1:]:
-        prev = merged[-1]
-        if seg.start - prev.end < min_gap:
-            # 合併：擴展前一段的結束時間
-            merged[-1] = Segment(start=prev.start, end=seg.end)
+    
+    if not true_hits:
+        return []
+        
+    current_start = true_hits[0]
+    last_hit_time = true_hits[0]
+    last_bounce_time = 0.0
+    consecutive_bounces = 0
+    
+    # 將事件合併排序 (時間, 種類)
+    events = [(t, 'HIT') for t in true_hits] + [(t, 'BOUNCE') for t in bounce_times]
+    events.sort(key=lambda x: x[0])
+    
+    for t, e_type in events:
+        if t < current_start:
+            continue
+            
+        if e_type == 'HIT':
+            last_hit_time = t
+            consecutive_bounces = 0 # 重置彈地計數器
+            
+        elif e_type == 'BOUNCE':
+            if t > last_hit_time:
+                consecutive_bounces += 1
+                last_bounce_time = t
+            
+            # 死球規則 1：連續兩次彈地
+            if consecutive_bounces >= 2:
+                # 回合結束在第二次彈地後 1.5 秒
+                segments.append(Segment(start=current_start - 1.0, end=t + 1.5))
+                # 尋找下一次開局
+                next_hit_idx = bisect.bisect_right(true_hits, t)
+                if next_hit_idx < len(true_hits):
+                    current_start = true_hits[next_hit_idx]
+                    last_hit_time = current_start
+                    consecutive_bounces = 0
+                else:
+                    current_start = None
+                    break
+        
+        # 死球規則 2：太久沒動作 (兜底，球可能飛出場外沒落地)
+        if t - last_hit_time > gap_threshold:
+            segments.append(Segment(start=current_start - 1.0, end=last_hit_time + 1.5))
+            
+            next_hit_idx = bisect.bisect_right(true_hits, t)
+            if next_hit_idx < len(true_hits):
+                current_start = true_hits[next_hit_idx]
+                last_hit_time = current_start
+                consecutive_bounces = 0
+            else:
+                current_start = None
+                break
+                
+    # 處理最後未閉合的局
+    if current_start is not None and len(true_hits) > 0 and current_start <= true_hits[-1]:
+        segments.append(Segment(start=current_start - 1.0, end=last_hit_time + 2.0))
+        
+    # 6. 修剪重疊與太短的片段
+    merged = []
+    for s in segments:
+        if s.duration < min_duration:
+            continue
+        if not merged:
+            merged.append(s)
         else:
-            merged.append(seg)
+            prev = merged[-1]
+            if s.start < prev.end:
+                merged[-1] = Segment(start=prev.start, end=max(prev.end, s.end))
+            else:
+                merged.append(s)
 
     return merged
-
-
-def _has_nearby_hit(time: float, sorted_hits: list[float], window: float = 0.5) -> bool:
-    """檢查指定時間點附近（±window 秒）是否有擊球聲。
-
-    使用二分搜尋在已排序的擊球時間列表中查找。
-    """
-    if not sorted_hits:
-        return False
-
-    # 找到第一個 >= time - window 的位置
-    idx = bisect.bisect_left(sorted_hits, time - window)
-
-    # 檢查該位置的值是否 <= time + window
-    if idx < len(sorted_hits) and sorted_hits[idx] <= time + window:
-        return True
-
-    return False
