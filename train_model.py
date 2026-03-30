@@ -9,9 +9,21 @@ def main():
     # 確保資料集配置檔存在
     yaml_path = os.path.abspath("dataset/dataset.yaml")
     if not os.path.exists(yaml_path):
-        print(f"❌ 找不到資料集定義檔: {yaml_path}")
-        print("請先在 Streamlit UI 進行「人工審核」來標註資料！\n")
-        return
+        # 檢查是否有標記資料
+        if not os.path.exists("dataset/images") or len(os.listdir("dataset/images")) == 0:
+            print("❌ 資料集空空如也！")
+            print("請先在 Streamlit UI 跑影片，並在「Step 2.5 軌跡迷失審核」中標註幾張照片再回來。")
+            return
+            
+        print("🛠️ 找不到 dataset.yaml，正在重新自動生成...")
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            f.write(f"path: {os.path.abspath('dataset')}\n")
+            f.write("train: images\n") # 直接拿同樣的 pool 做 training
+            f.write("val: images\n")   # 和 validation
+            f.write("\n")
+            f.write("names:\n")
+            f.write("  0: pickleball\n")
+        print(f"✅ 生成完畢: {yaml_path}")
 
     # 檢查有沒有之前的訓練權重，如果沒有，就從官方 pretrain 權重開始
     # 也可以固定每次都從 yolov8n.pt 開始 Fine-tune，避免對過度少量的資料 overfitting
@@ -26,8 +38,11 @@ def main():
         data=yaml_path,
         epochs=100,            # 最大輪數
         patience=20,           # Early stopping 檢查輪數
-        imgsz=640,             # 輸入推論尺寸
-        batch=16,              # 批次數量 (視顯示卡 VRAM 大小可調節為 8, 4 等等)
+        imgsz=320,             # 【效能加速】輸入尺寸改為 320 (與我們的追蹤器相同，速度快 4 倍！)
+        batch=16,              # 批次數量
+        device=0,              # 強制指定 GPU
+        workers=0,             # 【效能加速】Windows 系統下，關閉 DataLoader 多進程反而比較快
+        cache=True,            # 【效能加速】把圖片快取在記憶體，跳過硬碟讀取
         project="dataset/runs",# 儲存主要路徑
         name="train",          # 子名稱
         exist_ok=True          # 每次覆蓋在同一個路徑下，以利 Tracker 直接抓到 best.pt
