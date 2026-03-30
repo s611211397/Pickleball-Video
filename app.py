@@ -7,7 +7,6 @@ import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
-from streamlit_cropper import st_cropper
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 from src.audio_analyzer import detect_hits, extract_audio
