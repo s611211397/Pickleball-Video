@@ -57,6 +57,7 @@ with st.sidebar:
                     )
                     if result.returncode == 0:
                         st.success("✅ 訓練大成功！系統已將最新的完美權重部署完成。下次重新分析影片即會自動套用。")
+                        st.info("💡 **別忘了備份模型**：最新優化的模型已獨立備份為 `models/pickleball_best.pt`，請記得找時間提交並 Push 到 GitHub 永久保存喔！")
                         st.balloons()
                     else:
                         st.error("❌ 訓練失敗。")
