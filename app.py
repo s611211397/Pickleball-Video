@@ -571,22 +571,23 @@ if "review_frames" in st.session_state and "current_review_idx" in st.session_st
         # 操作按鈕 — 大塊並排
         b1, b2, b3, b4 = st.columns(4)
         with b1:
-            if st.button("✅ 有球（略過）", use_container_width=True):
+            if st.button("✅ 略過此張 (交由 AI 處理)", use_container_width=True):
                 st.session_state["current_review_idx"] += 1
                 st.rerun()
         with b2:
-            if st.button("❌ 無球", use_container_width=True, type="primary"):
+            if st.button("❌ 這張沒球", use_container_width=True, type="primary"):
                 st.session_state["pending_annotations"].append(
                     (data["frame"], f"{Path(video_path).stem}_f{frame_idx}", None)
                 )
                 st.session_state["current_review_idx"] += 1
                 st.rerun()
         with b3:
-            # 計算後續連號幀數，一次標記
-            if st.button("❌❌ 連續無球", use_container_width=True, type="primary"):
+            # 計算該連續段落的所有問題幀 (允許最大間隔 <= 30，涵蓋 LOST 抽樣)
+            if st.button("❌❌ 接下來都沒球", use_container_width=True, type="primary"):
                 count = 1
                 for k in range(idx + 1, len(review_frames)):
-                    if review_frames[k] == review_frames[k - 1] + 1:
+                    # 如果下一個問題圖跟這張隔不到 30 幀，代表是同一次「跟丟」的連續區間
+                    if review_frames[k] - review_frames[k - 1] <= 30:
                         count += 1
                     else:
                         break
@@ -598,8 +599,14 @@ if "review_frames" in st.session_state and "current_review_idx" in st.session_st
                 st.session_state["current_review_idx"] += count
                 st.rerun()
         with b4:
-            if st.button("⏭ 略過", use_container_width=True):
-                st.session_state["current_review_idx"] += 1
+            if st.button("⏭ 直接跳過這段", use_container_width=True):
+                count = 1
+                for k in range(idx + 1, len(review_frames)):
+                    if review_frames[k] - review_frames[k - 1] <= 30:
+                        count += 1
+                    else:
+                        break
+                st.session_state["current_review_idx"] += count
                 st.rerun()
 
         st.stop()
