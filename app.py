@@ -495,21 +495,24 @@ if "review_frames" in st.session_state and "current_review_idx" in st.session_st
                 tracking_data[frame_idx]["conf"] = 1.0
                 tracking_data[frame_idx]["status"] = "DETECTED"
                 st.session_state["current_review_idx"] += 1
+                st.rerun()
         else:
             st.warning("此幀無影像資料")
 
 
-        # 操作按鈕 — 大塊並排，不呼叫 st.rerun()
+        # 操作按鈕 — 大塊並排
         b1, b2, b3, b4 = st.columns(4)
         with b1:
             if st.button("✅ 有球（略過）", use_container_width=True):
                 st.session_state["current_review_idx"] += 1
+                st.rerun()
         with b2:
             if st.button("❌ 無球", use_container_width=True, type="primary"):
                 st.session_state["pending_annotations"].append(
                     (data["frame"], f"{Path(video_path).stem}_f{frame_idx}", None)
                 )
                 st.session_state["current_review_idx"] += 1
+                st.rerun()
         with b3:
             # 計算後續連號幀數，一次標記
             if st.button("❌❌ 連續無球", use_container_width=True, type="primary"):
@@ -525,9 +528,11 @@ if "review_frames" in st.session_state and "current_review_idx" in st.session_st
                         (tracking_data[fi]["frame"], f"{Path(video_path).stem}_f{fi}", None)
                     )
                 st.session_state["current_review_idx"] += count
+                st.rerun()
         with b4:
             if st.button("⏭ 略過", use_container_width=True):
                 st.session_state["current_review_idx"] += 1
+                st.rerun()
 
         st.stop()
 
