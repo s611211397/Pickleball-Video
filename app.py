@@ -45,27 +45,48 @@ with st.sidebar:
     
     if num_labels > 0:
         if st.button("🚀 開始 Fine-tune 訓練", use_container_width=True, type="primary"):
-            st.warning("⚠️ 訓練期間將會占用 GPU 資源，且可能耗時數分鐘到數十分鐘。請勿關閉或重新整理此視窗。詳細進度會顯示於運行本程式的終端機。")
-            with st.spinner("⏳ 正在訓練 YOLOv8 模型中，請查看終端機黑窗..."):
-                import subprocess
-                try:
-                    # 使用 subprocess 呼叫，避免 Streamlit 迴圈阻塞輸出
-                    result = subprocess.run(
-                        [sys.executable, "train_model.py"],
-                        capture_output=True,
-                        text=True,
-                        check=False
-                    )
-                    if result.returncode == 0:
-                        st.success("✅ 訓練大成功！系統已將最新的完美權重部署完成。下次重新分析影片即會自動套用。")
-                        st.info("💡 **別忘了備份模型**：最新優化的模型已獨立備份為 `models/pickleball_best.pt`，請記得找時間提交並 Push 到 GitHub 永久保存喔！")
-                        st.balloons()
-                    else:
-                        st.error("❌ 訓練失敗。")
-                        with st.expander("查看詳細錯誤 Log"):
-                            st.code(result.stderr[-2000:], language="bash")
-                except Exception as e:
-                    st.error(f"無法啟動訓練腳本: {e}")
+            import subprocess
+            st.info(f"📊 使用 **{num_labels}** 張標註影像進行訓練")
+            log_area = st.empty()
+            status_area = st.empty()
+            status_area.warning("⏳ 訓練進行中，請勿關閉或重新整理此視窗...")
+
+            try:
+                process = subprocess.Popen(
+                    [sys.executable, "-u", "train_model.py"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+
+                log_lines = []
+                with log_area.container():
+                    log_display = st.empty()
+                    while True:
+                        line = process.stdout.readline()
+                        if not line and process.poll() is not None:
+                            break
+                        if line:
+                            line = line.rstrip()
+                            log_lines.append(line)
+                            # 只保留最近 30 行，避免 UI 太長
+                            visible = log_lines[-30:]
+                            log_display.code("\n".join(visible), language="bash")
+
+                returncode = process.wait()
+                if returncode == 0:
+                    status_area.empty()
+                    st.success("✅ 訓練完成！最新模型已部署。下次分析影片會自動套用。")
+                    st.info("💡 模型已備份至 `models/pickleball_best.pt`，記得 Push 到 GitHub 永久保存！")
+                    st.balloons()
+                else:
+                    status_area.empty()
+                    st.error("❌ 訓練失敗，請查看上方 Log 輸出。")
+
+            except Exception as e:
+                status_area.empty()
+                st.error(f"無法啟動訓練腳本: {e}")
     else:
         st.info("💡 目前還沒有問題幀資料。\n請多上傳比賽影片，並在「Step 2.5：軌跡迷失審核」步驟中，點選畫面指示正確位置來累積訓練素材！")
 
