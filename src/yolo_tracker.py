@@ -41,6 +41,7 @@ def _get_model(pt_path: str, device: int | str, use_half: bool) -> YOLO:
                 imgsz=INFER_SIZE,
                 half=use_half,
                 device=device,
+                dynamic=True,   # 允許彈性批次大小，批次推論必須設定
             )
             # ultralytics 預設會在同目錄下產生同名 .engine
             default_engine = Path(pt_path).with_suffix(".engine")
