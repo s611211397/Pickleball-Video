@@ -189,5 +189,55 @@ def draw_courts_on_frame(
         cv2.rectangle(vis, (x, y - th - 16), (x + tw + 10, y), color, -1)
         cv2.putText(vis, label, (x + 5, y - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 2)
-
     return vis
+
+
+def compute_roi_from_keypoints(points: list[dict]) -> dict:
+    """從使用者選取的角點計算 ROI 範圍"""
+    if len(points) == 0:
+        return None
+        
+    xs = [p["x"] for p in points]
+    ys = [p["y"] for p in points]
+    
+    x1, y1 = min(xs), min(ys)
+    x2, y2 = max(xs), max(ys)
+    
+    # 稍微往外擴展一點範圍作為 ROI
+    padding = 20
+    x = max(0, x1 - padding)
+    y = max(0, y1 - padding)
+    w = x2 - x1 + padding * 2
+    h = y2 - y1 + padding * 2
+    
+    return {"x": x, "y": y, "w": w, "h": h, "points": points}
+
+
+def get_perspective_matrix(points: list[dict]):
+    """
+    從 10 個標準匹克球場角點計算透視轉換矩陣。
+    標準角點 A~J，我們這裡至少需要 4 個點 (例如四個角落) 來做轉換。
+    這裡假設：點 0, 1, 2, 3 分別對應 左上(A), 右上(B), 左下(C), 右下(D) (這取決於 UI 點擊順序要求)
+    匹克球場標準尺寸：6.1m x 13.4m。若映射到畫面 610x1340。
+    """
+    if len(points) < 4:
+        return None
+        
+    # 定義目標標準座標 (寬610, 高1340)
+    dst_pts = np.array([
+        [0, 0],         # 左上 (對應真實場地 A)
+        [610, 0],       # 右上 (對應 B)
+        [0, 1340],      # 左下 (對應 C)
+        [610, 1340]     # 右下 (對應 D)
+    ], dtype="float32")
+    
+    # 從輸入抓前四個點當作邊角
+    src_pts = np.array([
+        [points[0]["x"], points[0]["y"]],
+        [points[1]["x"], points[1]["y"]],
+        [points[2]["x"], points[2]["y"]],
+        [points[3]["x"], points[3]["y"]]
+    ], dtype="float32")
+    
+    matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    return matrix
