@@ -311,7 +311,13 @@ def analyze_video_with_yolo(
                 "frame": save_frame,
             })
 
+            # 除了預測中跟低信心的以外，如果球完全丟失 (LOST)，我們也必須讓使用者有機會標記
+            # 每 30 幀 (約 1 秒) 抽取一張 LOST 的幀進入審核池，避免使用者連點擊介面都看不到！
             if status == "PREDICTED" or (0.01 <= conf_out < high_conf_thresh):
+                review_frames.append(cur_idx)
+            elif status == "LOST" and cur_idx % 30 == 0:
+                # 為了避免記憶體爆掉，特別為 LOST 幀儲存影像
+                tracking_data[-1]["frame"] = frame.copy()
                 review_frames.append(cur_idx)
 
         absolute_frame_idx += len(batch_frames)
