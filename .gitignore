@@ -16,3 +16,7 @@ roi.json
 output/
 *.wav
 _concat_list.txt
+
+# Dataset & ML
+dataset/
+runs/
