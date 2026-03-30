@@ -1,5 +1,18 @@
 import os
-from ultralytics import YOLO
+import sys
+import subprocess
+
+def _ensure_ultralytics():
+    """確保 ultralytics 已安裝，若未安裝則自動安裝。"""
+    try:
+        from ultralytics import YOLO
+        return YOLO
+    except ImportError:
+        print("⚠️ 偵測到 ultralytics 尚未安裝，正在自動安裝中...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "ultralytics>=8.1.0"])
+        from ultralytics import YOLO
+        print("✅ ultralytics 安裝完成！")
+        return YOLO
 
 def main():
     print("========================================")
@@ -27,8 +40,10 @@ def main():
 
     # 檢查有沒有之前的訓練權重，如果沒有，就從官方 pretrain 權重開始
     # 也可以固定每次都從 yolov8n.pt 開始 Fine-tune，避免對過度少量的資料 overfitting
+    YOLO = _ensure_ultralytics()
+
     start_weights = 'yolov8n.pt'
-    
+
     print(f"➡️ 讀取初始模型: {start_weights}")
     model = YOLO(start_weights)
 

@@ -1,5 +1,6 @@
 """Pickleball Auto-Editor — Streamlit Web UI"""
 
+import sys
 import tempfile
 from pathlib import Path
 
@@ -50,7 +51,7 @@ with st.sidebar:
                 try:
                     # 使用 subprocess 呼叫，避免 Streamlit 迴圈阻塞輸出
                     result = subprocess.run(
-                        ["python", "train_model.py"],
+                        [sys.executable, "train_model.py"],
                         capture_output=True,
                         text=True,
                         check=False
