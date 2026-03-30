@@ -49,7 +49,7 @@ def _get_model(pt_path: str, device: int | str, use_half: bool) -> YOLO:
             # ultralytics 預設會在同目錄下產生同名 .engine
             default_engine = Path(pt_path).with_suffix(".engine")
             if default_engine.exists():
-                default_engine.rename(engine_path)
+                default_engine.replace(engine_path)
             if engine_path.exists():
                 logger.info(f"✅ TensorRT Engine 匯出成功，已儲存到: {engine_path}")
                 print(f"✅ TensorRT Engine 匯出成功！之後都會直接使用加速版本。")
