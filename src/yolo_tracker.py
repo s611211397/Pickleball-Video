@@ -157,8 +157,12 @@ def analyze_video_with_yolo(video_path, roi, conf_thresh=0.2, high_conf_thresh=0
     
     frame_idx = 0
     while True:
-        ret, frame = cap.read()
-        if not ret:
+        try:
+            ret, frame = cap.read()
+            if not ret:
+                break
+        except Exception as e:
+            print(f"警告：讀取第 {frame_idx} 幀時發生錯誤 ({e})，停止讀取後續影格。")
             break
             
         # 追蹤

@@ -151,12 +151,15 @@ def analyze_video_motion(
     with tqdm(total=total_frames, desc="分析動態", unit="frame") as pbar:
         while True:
             if frame_idx % frame_skip == 0:
-                # 需要分析的幀：完整解碼
-                ret = cap.grab()
-                if not ret:
-                    break
-                ret, curr_frame = cap.retrieve()
-                if not ret:
+                try:
+                    ret = cap.grab()
+                    if not ret:
+                        break
+                    ret, curr_frame = cap.retrieve()
+                    if not ret:
+                        break
+                except Exception as e:
+                    print(f"警告：讀取第 {frame_idx} 幀時發生錯誤 ({e})，停止讀取後續影格。")
                     break
 
                 curr_gray = _extract_roi_gray(curr_frame, roi, roi_scale)
@@ -175,7 +178,11 @@ def analyze_video_motion(
                     progress_callback(pct, f"已分析 {analyze_count} 個時間點...")
             else:
                 # 跳過的幀：只 grab 不 decode，快很多
-                if not cap.grab():
+                try:
+                    if not cap.grab():
+                        break
+                except Exception as e:
+                    print(f"警告：掠過第 {frame_idx} 幀時發生錯誤 ({e})，停止讀取後續影格。")
                     break
 
             frame_idx += 1
