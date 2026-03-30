@@ -65,36 +65,39 @@ def detect_rallies(
     ys_smooth = savgol_filter(ys_interp, window_length=window, polyorder=2)
     
     # 3. 尋找「落地點 (Bounce)」
-    # 影像中的 Y 軸朝下，所以球往地上砸再彈起，Y座標會是一個局部的「最大值 (Peak)」
-    # prominence=15 代表這個落地彈跳在畫面上至少有15像素的高度差
-    bounce_idxs, _ = find_peaks(ys_smooth, prominence=15, distance=10)
+    bounce_idxs, _ = find_peaks(ys_smooth, prominence=10, distance=5)
     bounce_times = times[bounce_idxs]
 
     # 4. 尋找「真實擊球點 (True Hits)」
-    # 影音交錯濾網：聲音有響，且畫面中的球正在移動中 (速度非零) 或軌跡有急折
     true_hits = []
     dx = np.abs(np.diff(xs_smooth, prepend=xs_smooth[0]))
     dy = np.abs(np.diff(ys_smooth, prepend=ys_smooth[0]))
     speed = np.sqrt(dx**2 + dy**2) # 綜合 2D 移動距離
     
-    for ht in sorted(hit_times):
-        # 尋找對應的影格 index
-        idx = bisect.bisect_left(times, ht)
-        if 0 <= idx < len(times):
-            # 檢查聲音發生時，前後 0.2 秒(約 6 幀) 內，球的狀態
-            search_start = max(0, idx - 6)
-            search_end = min(len(times), idx + 6)
-            
-            # 如果這段期間內球遺失得太嚴重，代表根本沒拍到球，極大機率是隔壁場
-            lost_ratio = np.sum(np.isnan(ys[search_start:search_end])) / (search_end - search_start + 1e-5)
-            if lost_ratio > 0.8:
-                continue
+    if len(hit_times) > 0:
+        # 動態影音融合模式
+        for ht in sorted(hit_times):
+            idx = bisect.bisect_left(times, ht)
+            if 0 <= idx < len(times):
+                search_start = max(0, idx - 6)
+                search_end = min(len(times), idx + 6)
                 
-            # 檢查球速（必須在移動中，避免死球躺在地上的聲音誤判）
-            avg_speed = np.mean(speed[search_start:search_end])
-            if avg_speed > 2.0: # 畫面中每幀綜合移動大於 2 pixel
-                true_hits.append(ht)
+                lost_ratio = np.sum(np.isnan(ys[search_start:search_end])) / (search_end - search_start + 1e-5)
+                if lost_ratio > 0.8:
+                    continue
+                    
+                avg_speed = np.mean(speed[search_start:search_end])
+                if avg_speed > 1.5: # 調低一點寬容度
+                    true_hits.append(ht)
+    else:
+        # 【純視覺備用模式】如果影片靜音或沒麥克風聲音，改用物理「速度暴增點」作為擊球點
+        hit_idxs, _ = find_peaks(speed, prominence=5, distance=15)
+        for idx in hit_idxs:
+            if not np.isnan(ys[idx]): # 確認當下球不是遺失狀態
+                true_hits.append(times[idx])
 
+    print(f"🧐 [裁判 2.0] 偵測報告：找到 {len(bounce_times)} 次落地, {len(hit_times)} 次聲學峰值, 過濾後得 {len(true_hits)} 次場內有效擊球 (True Hits)")
+    
     # 5. 語意裁判引擎 (State Machine)
     # 規則：以第一個 True Hit 為發球，之後若發生「連續兩次 bounce 中間無 hit」則死球結束
     segments = []
