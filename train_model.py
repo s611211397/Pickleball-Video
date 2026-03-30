@@ -34,6 +34,7 @@ def main():
 
     print("\n🚀 開始訓練模型 (Fine-tuning)...")
     # 訓練模型參數設定
+    project_path = os.path.abspath("dataset/runs")
     results = model.train(
         data=yaml_path,
         epochs=100,            # 最大輪數
@@ -43,21 +44,33 @@ def main():
         device=0,              # 強制指定 GPU
         workers=0,             # 【效能加速】Windows 系統下，關閉 DataLoader 多進程反而比較快
         cache=True,            # 【效能加速】把圖片快取在記憶體，跳過硬碟讀取
-        project="dataset/runs",# 儲存主要路徑
+        project=project_path,  # 儲存主要路徑 (使用絕對路徑)
         name="train",          # 子名稱
         exist_ok=True          # 每次覆蓋在同一個路徑下，以利 Tracker 直接抓到 best.pt
     )
     
+    # ultralytics 回傳的 results 有 save_dir，這才是真正的儲存路徑
+    actual_save_dir = str(results.save_dir) if hasattr(results, 'save_dir') else os.path.join(project_path, "train")
+    best_weight_path = os.path.join(actual_save_dir, "weights", "best.pt")
+    
     print("\n✅ 訓練完成！")
-    print("最新權重已儲存在: dataset/runs/train/weights/best.pt")
+    print(f"最新權重已儲存在: {best_weight_path}")
     
     # 自動將產出模型複製到獨立資料夾以便 Git 追蹤
     import shutil
     os.makedirs("models", exist_ok=True)
-    best_weight_path = "dataset/runs/train/weights/best.pt"
+    
     if os.path.exists(best_weight_path):
         shutil.copy(best_weight_path, "models/pickleball_best.pt")
         print("💾 模型已自動備份至獨立資料夾: models/pickleball_best.pt (此檔案可提交至 Git)")
+    else:
+        # 兼容另一種路徑可能性
+        fallback_path = os.path.abspath(r"runs\detect\dataset\runs\train\weights\best.pt")
+        if os.path.exists(fallback_path):
+             shutil.copy(fallback_path, "models/pickleball_best.pt")
+             print("💾 模型已自動從備用路徑備份至: models/pickleball_best.pt")
+        else:
+             print("⚠️ 找不到最佳權重檔 (best.pt) 未能自動備份！")
 
     print("下次在 Streamlit 進行影片分析時，系統將自動優先載入這個最新模型！")
     print("\n========================================")
