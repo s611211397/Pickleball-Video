@@ -12,7 +12,11 @@ logger = logging.getLogger(__name__)
 
 class BallTracker:
     def __init__(self, model_path: str = "yolov8n.pt", conf_thresh: float = 0.2, high_conf_thresh: float = 0.5):
+        self.device = 0 if torch.cuda.is_available() else "cpu"
+        self.use_half = torch.cuda.is_available()
         self.model = YOLO(model_path)
+        self.model.to(self.device)
+        logger.info(f"BallTracker 使用裝置: {'GPU (CUDA)' if self.device == 0 else 'CPU'}")
         self.conf_thresh = conf_thresh
         self.high_conf_thresh = high_conf_thresh
         
@@ -85,8 +89,8 @@ class BallTracker:
             search_area, 
             classes=[32], 
             verbose=False, 
-            device=0 if torch.cuda.is_available() else "cpu", 
-            half=True if torch.cuda.is_available() else False
+            device=self.device,
+            half=self.use_half
         )
         
         best_box = None
@@ -142,7 +146,7 @@ class BallTracker:
                 self.is_tracking = False
                 return None, 0.0, "LOST"
 
-def analyze_video_with_yolo(video_path, roi, conf_thresh=0.2, high_conf_thresh=0.5, progress_callback=None):
+def analyze_video_with_yolo(video_path, roi, conf_thresh=0.2, high_conf_thresh=0.5, progress_callback=None, batch_size=16):
     model_name = "yolov8n.pt"
     
     # 若有客製化的備份模型則優先使用
@@ -163,39 +167,125 @@ def analyze_video_with_yolo(video_path, roi, conf_thresh=0.2, high_conf_thresh=0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     
-    tracking_data = [] # stores movement history
-    review_frames = [] # frame indices for active learning
+    # 預先裁切 ROI 的偏移量
+    if roi:
+        rx, ry, rw, rh = roi["x"], roi["y"], roi["w"], roi["h"]
+    else:
+        rx, ry = 0, 0
     
+    tracking_data = []
+    review_frames = []
     frame_idx = 0
+    
     while True:
-        try:
-            ret, frame = cap.read()
-            if not ret:
+        # ── 讀進一批幀 ──────────────────────────
+        batch_frames = []   # 原始 BGR 完整幀
+        batch_areas = []    # 裁切後送 YOLO 的區塊
+        
+        for _ in range(batch_size):
+            try:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+            except Exception as e:
+                print(f"警告：讀取第 {frame_idx + len(batch_frames)} 幀時發生錯誤 ({e})，停止讀取後續影格。")
                 break
-        except Exception as e:
-            print(f"警告：讀取第 {frame_idx} 幀時發生錯誤 ({e})，停止讀取後續影格。")
+            
+            batch_frames.append(frame)
+            
+            if roi:
+                area = frame[ry:ry+rh, rx:rx+rw].copy()
+                # 多邊形遮罩
+                if "points" in roi and len(roi["points"]) >= 3:
+                    mask = np.zeros(area.shape[:2], dtype=np.uint8)
+                    pts = np.array([[[p["x"] - rx, p["y"] - ry] for p in roi["points"]]], dtype=np.int32)
+                    cv2.fillPoly(mask, pts, 255)
+                    area = cv2.bitwise_and(area, area, mask=mask)
+            else:
+                area = frame
+            batch_areas.append(area)
+        
+        if not batch_frames:
             break
+        
+        # ── 一次性批次送進 YOLO ──────────────────
+        batch_results = tracker.model.predict(
+            batch_areas,
+            classes=[32],
+            verbose=False,
+            device=tracker.device,
+            half=tracker.use_half,
+        )
+        
+        # ── 逐幀套用 Kalman Filter 並記錄結果 ────
+        for i, (frame, result) in enumerate(zip(batch_frames, batch_results)):
+            cur_idx = frame_idx + i
             
-        # 追蹤
-        box, conf, status = tracker.track(frame, roi=roi)
-        
-        tracking_data.append({
-            "frame_idx": frame_idx,
-            "time": frame_idx / fps if fps > 0 else 0,
-            "box": box,
-            "conf": conf,
-            "status": status,
-            "frame": frame.copy() if status == "PREDICTED" or (0.01 <= conf < high_conf_thresh) else None
-        })
-        
-        # 判斷是否需要人工審核 (有球但信心不夠，或者是本來有球卻 LOST 的前後)
-        if status == "PREDICTED" or (0.01 <= conf < high_conf_thresh):
-            review_frames.append(frame_idx)
+            # 找這幀最高信心的框
+            best_box = None
+            best_conf = 0.0
+            if len(result.boxes) > 0:
+                for box in result.boxes:
+                    c = float(box.conf[0])
+                    if c > best_conf:
+                        best_conf = c
+                        bx, by, bw, bh = box.xywh[0].cpu().numpy()
+                        best_box = {
+                            "x": int(bx - bw/2) + rx,
+                            "y": int(by - bh/2) + ry,
+                            "w": int(bw),
+                            "h": int(bh),
+                        }
             
-        frame_idx += 1
+            # Kalman Filter 更新
+            tracker.kf.predict()
+            if best_box and best_conf >= tracker.conf_thresh:
+                cx = best_box["x"] + best_box["w"] / 2
+                cy = best_box["y"] + best_box["h"] / 2
+                if not tracker.is_tracking:
+                    tracker.kf.x = np.array([cx, cy, 0, 0]).reshape(4, 1)
+                    tracker.is_tracking = True
+                else:
+                    tracker.kf.update(np.array([cx, cy]).reshape(2, 1))
+                tracker.missed_frames = 0
+                status = "DETECTED"
+                box_out = best_box
+                conf_out = best_conf
+            else:
+                tracker.missed_frames += 1
+                if tracker.is_tracking and tracker.missed_frames <= tracker.max_missed_frames:
+                    pred_x = int(tracker.kf.x[0, 0])
+                    pred_y = int(tracker.kf.x[1, 0])
+                    box_out = {"x": pred_x - 10, "y": pred_y - 10, "w": 20, "h": 20}
+                    conf_out = best_conf
+                    status = "PREDICTED"
+                else:
+                    tracker.is_tracking = False
+                    box_out = None
+                    conf_out = 0.0
+                    status = "LOST"
+            
+            save_frame = frame.copy() if status == "PREDICTED" or (0.01 <= conf_out < high_conf_thresh) else None
+            tracking_data.append({
+                "frame_idx": cur_idx,
+                "time": cur_idx / fps if fps > 0 else 0,
+                "box": box_out,
+                "conf": conf_out,
+                "status": status,
+                "frame": save_frame,
+            })
+            
+            if status == "PREDICTED" or (0.01 <= conf_out < high_conf_thresh):
+                review_frames.append(cur_idx)
         
-        if progress_callback and frame_idx % 30 == 0:
-            progress_callback(frame_idx / total_frames, f"YOLO 追蹤分析中 ({frame_idx}/{total_frames})")
+        frame_idx += len(batch_frames)
+        
+        if progress_callback and frame_idx % (batch_size * 2) == 0:
+            progress_callback(frame_idx / total_frames, f"YOLO 批次追蹤中 ({frame_idx}/{total_frames})")
+        
+        # 如果這批幀數不足 batch_size，代表影片已結束
+        if len(batch_frames) < batch_size:
+            break
             
     cap.release()
     return tracking_data, review_frames
