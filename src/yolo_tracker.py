@@ -2,6 +2,7 @@
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 from filterpy.kalman import KalmanFilter
 import logging
@@ -80,7 +81,13 @@ class BallTracker:
             search_area = frame
             x, y = 0, 0
             
-        results = self.model.predict(search_area, classes=[32], verbose=False)
+            results = self.model.predict(
+                search_area, 
+                classes=[32], 
+                verbose=False, 
+                device=0 if torch.cuda.is_available() else "cpu", 
+                half=True if torch.cuda.is_available() else False
+            )
         
         best_box = None
         best_conf = 0.0
