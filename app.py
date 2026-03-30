@@ -17,6 +17,7 @@ from src.rally_detector import Segment, detect_rallies
 from src.video_exporter import export_segments, merge_segments
 from src.yolo_tracker import analyze_video_with_yolo
 from src.dataset_manager import DatasetManager
+from src.review_session import save_review_session, load_review_session, has_saved_session, delete_session
 
 # ─────────────────────────────────────────────
 # 頁面設定
@@ -242,6 +243,39 @@ st.success(
 if first_frame is None:
     st.error("無法讀取影片第一幀")
     st.stop()
+
+# ─────────────────────────────────────────────
+# 檢查是否有未完成的審核進度可恢復
+# ─────────────────────────────────────────────
+if "review_frames" not in st.session_state:
+    saved_info = has_saved_session(uploaded.name)
+    if saved_info is not None:
+        st.info(
+            f"📂 偵測到上次未完成的審核進度！\n\n"
+            f"- 已審核：**{saved_info['current']}** / {saved_info['total']} 張\n"
+            f"- 剩餘未審核：**{saved_info['remaining']}** 張\n"
+            f"- 已偵測回合：**{saved_info['segments_count']}** 段"
+        )
+        resume_col, new_col = st.columns(2)
+        with resume_col:
+            if st.button("▶️ 繼續上次的審核", type="primary", use_container_width=True):
+                session = load_review_session(uploaded.name)
+                if session:
+                    st.session_state["tracking_data"] = session["tracking_data"]
+                    st.session_state["review_frames"] = session["review_frames"]
+                    st.session_state["current_review_idx"] = session["current_review_idx"]
+                    st.session_state["pending_annotations"] = []
+                    st.session_state["segments"] = session["segments"]
+                    st.session_state["motion_timeline"] = session["motion_timeline"]
+                    st.session_state["hit_times"] = session["hit_times"]
+                    if session["roi"]:
+                        st.session_state["manual_roi"] = session["roi"]
+                        st.session_state["selected_court"] = -1
+                    st.rerun()
+        with new_col:
+            if st.button("🔄 重新分析（捨棄舊進度）", use_container_width=True):
+                delete_session(uploaded.name)
+                st.rerun()
 
 # ─────────────────────────────────────────────
 # Step 1: 球場偵測 + ROI 選取
@@ -486,6 +520,19 @@ if st.button("🚀 開始分析", type="primary", use_container_width=True):
         audio_weight=audio_weight, motion_threshold=motion_threshold,
     )
     st.session_state["segments"] = segments
+    progress.progress(95, text="💾 儲存審核進度中...")
+
+    # 分析完畢後自動儲存審核進度，方便下次恢復
+    save_review_session(
+        video_name=uploaded.name,
+        review_frames=review_frames,
+        current_review_idx=0,
+        tracking_data=tracking_data,
+        segments=segments,
+        motion_timeline=motion_timeline,
+        hit_times=hit_times,
+        roi=roi,
+    )
     progress.progress(100, text="✅ 分析完成！")
     st.rerun()
 
@@ -533,7 +580,29 @@ if "review_frames" in st.session_state and "current_review_idx" in st.session_st
                 f"狀態: **{status_label}** ({conf_pct}) | 本段共 {seg_count} 張問題幀"
             )
         with save_col:
-            if st.button("💾 儲存並結束", use_container_width=True):
+            if st.button("💾 儲存進度", use_container_width=True,
+                         help="儲存目前審核進度，下次可繼續"):
+                # 先存 pending annotations 到 dataset
+                if st.session_state.get("pending_annotations"):
+                    dm = DatasetManager()
+                    for frm, name, box in st.session_state["pending_annotations"]:
+                        if frm is not None:
+                            dm.save_annotation(frm, name, box)
+                    st.session_state["pending_annotations"] = []
+
+                # 儲存審核進度到磁碟
+                save_review_session(
+                    video_name=uploaded.name,
+                    review_frames=review_frames,
+                    current_review_idx=idx,
+                    tracking_data=tracking_data,
+                    segments=st.session_state.get("segments", []),
+                    motion_timeline=st.session_state.get("motion_timeline", []),
+                    hit_times=st.session_state.get("hit_times"),
+                    roi=roi,
+                )
+                st.toast(f"✅ 審核進度已儲存！（{idx}/{len(review_frames)}）下次上傳同一影片即可繼續。")
+                # 跳出審核模式，讓使用者看到結果
                 st.session_state["current_review_idx"] = len(review_frames)
                 st.rerun()
 
@@ -717,9 +786,13 @@ if "review_frames" in st.session_state and "current_review_idx" in st.session_st
             with st.spinner("💾 正在將標記寫入硬碟中，請稍候..."):
                 dm = DatasetManager()
                 for frm, name, box in st.session_state["pending_annotations"]:
-                    dm.save_annotation(frm, name, box)
+                    if frm is not None:
+                        dm.save_annotation(frm, name, box)
             st.session_state["pending_annotations"] = []
             st.toast("✅ 問題軌跡審核告一段落，已存入 dataset 供日後訓練使用！")
+
+        # 全部審核完畢 → 刪除已完成的 session 檔案
+        delete_session(uploaded.name)
 
 
 # ─────────────────────────────────────────────
