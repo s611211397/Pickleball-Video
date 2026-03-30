@@ -1,6 +1,9 @@
 """YOLO 物件追蹤與分析模組 (GPU 最佳化版本)"""
 
 import cv2
+import time
+import queue
+import threading
 import numpy as np
 import torch
 from ultralytics import YOLO
@@ -160,6 +163,47 @@ def _kalman_step(tracker: BallTracker, best_box, best_conf):
             return None, 0.0, "LOST"
 
 
+# ─── 多執行緒影像讀取 (消除硬碟 IO 瓶頸) ──────────────────
+class ThreadedVideo:
+    def __init__(self, path, queue_size=256):
+        self.cap = cv2.VideoCapture(path)
+        self.q = queue.Queue(maxsize=queue_size)
+        self.stopped = False
+        
+        # 啟動背景執行緒專門負責讀檔
+        self.t = threading.Thread(target=self._update)
+        self.t.daemon = True
+        self.t.start()
+
+    def _update(self):
+        while True:
+            if self.stopped:
+                return
+            if not self.q.full():
+                ret, frame = self.cap.read()
+                if not ret:
+                    self.stopped = True
+                    self.q.put((False, None)) # 放入結束標記
+                    return
+                self.q.put((True, frame))
+            else:
+                time.sleep(0.005) # 倉庫滿了就歇會兒
+
+    def read(self):
+        if self.stopped and self.q.empty():
+            return False, None
+        return self.q.get()
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def get(self, propId):
+        return self.cap.get(propId)
+
+    def release(self):
+        self.stopped = True
+        self.cap.release()
+
 # ─── 主分析函式 ───────────────────────────────────────────────
 def analyze_video_with_yolo(
     video_path,
@@ -189,7 +233,8 @@ def analyze_video_with_yolo(
     # TRT 引擎有 ultralytics batch 推論 bug，改為逐幀送入（TRT 本身速度仍遠快於 PyTorch）
     effective_batch = 1 if tracker.is_trt else batch_size
 
-    cap = cv2.VideoCapture(video_path)
+    # 使用多執行緒讀取，不再讓 main thread 等待影片解碼
+    cap = ThreadedVideo(video_path)
     if not cap.isOpened():
         return [], []
 
@@ -271,13 +316,14 @@ def analyze_video_with_yolo(
 
         absolute_frame_idx += len(batch_frames)
 
-        if progress_callback and absolute_frame_idx % (batch_size * 2) == 0:
+        # 降低 Streamlit 進度條更新頻率 (每 90 幀更新一次)，減少網頁更新造成的延遲
+        if progress_callback and absolute_frame_idx % 90 < effective_batch:
             progress_callback(
                 absolute_frame_idx / total_frames,
-                f"YOLO 批次追蹤中 ({absolute_frame_idx}/{total_frames})，推論幀率 1/{infer_every}"
+                f"YOLO 追蹤中 ({absolute_frame_idx}/{total_frames})，推論幀率 1/{infer_every}"
             )
 
-        if len(batch_frames) < batch_size:
+        if len(batch_frames) < effective_batch:
             break
 
     cap.release()
