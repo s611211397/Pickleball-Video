@@ -408,6 +408,7 @@ if st.button("🚀 開始分析", type="primary", use_container_width=True):
     st.session_state["tracking_data"] = tracking_data
     st.session_state["review_frames"] = review_frames
     st.session_state["current_review_idx"] = 0
+    st.session_state["pending_annotations"] = []
 
     # 同時執行傳統動態分析 (供後續相容)
     motion_timeline = analyze_video_motion(
@@ -476,10 +477,11 @@ if "review_frames" in st.session_state and "current_review_idx" in st.session_st
                 
             with c2:
                 if click_val is not None:
-                    # 進行紀錄
-                    dm = DatasetManager()
+                    # 不立刻存檔，先放在記憶體
                     box = {"x": click_val["x"] - 10, "y": click_val["y"] - 10, "w": 20, "h": 20}
-                    dm.save_annotation(frame_bgr, f"{Path(video_path).stem}_f{frame_idx}", box)
+                    st.session_state["pending_annotations"].append(
+                        (frame_bgr, f"{Path(video_path).stem}_f{frame_idx}", box)
+                    )
                     
                     # 覆蓋 tracking data 修正
                     tracking_data[frame_idx]["box"] = box
@@ -490,18 +492,50 @@ if "review_frames" in st.session_state and "current_review_idx" in st.session_st
                     st.rerun()
                     
                 if st.button("沒有球 / 飛出界外", use_container_width=True):
-                    dm = DatasetManager()
-                    dm.save_annotation(frame_bgr, f"{Path(video_path).stem}_f{frame_idx}", None)
+                    st.session_state["pending_annotations"].append(
+                        (frame_bgr, f"{Path(video_path).stem}_f{frame_idx}", None)
+                    )
                     st.session_state["current_review_idx"] += 1
                     st.rerun()
+
+                if st.button("這張及後續「連續鏡頭」皆無球", use_container_width=True, type="primary"):
+                    consecutive_count = 1
+                    for k in range(idx + 1, len(review_frames)):
+                        if review_frames[k] == review_frames[k-1] + 1:
+                            consecutive_count += 1
+                        else:
+                            break
+                    for k_offset in range(consecutive_count):
+                        f_idx = review_frames[idx + k_offset]
+                        frm_bgr = tracking_data[f_idx]["frame"]
+                        st.session_state["pending_annotations"].append(
+                            (frm_bgr, f"{Path(video_path).stem}_f{f_idx}", None)
+                        )
+                    st.session_state["current_review_idx"] += consecutive_count
+                    st.rerun()
                     
-                if st.button("略過", use_container_width=True):
+                if st.button("略過此張圖", use_container_width=True):
                     st.session_state["current_review_idx"] += 1
+                    st.rerun()
+
+                st.divider()
+
+                if st.button("💾 儲存已標註內容並進入下一步", use_container_width=True):
+                    # 把 index 推向結尾，這樣會直接進到底下的 elif 區塊存檔
+                    st.session_state["current_review_idx"] = len(review_frames)
                     st.rerun()
         
         st.stop() # 阻擋後續顯示，強制先標註完
     elif len(review_frames) > 0 and idx >= len(review_frames):
-        st.success("✅ 所有問題軌跡皆審核標註完畢，並存入 dataset 供日後訓練使用！")
+        # 全部批次寫入資料夾
+        if "pending_annotations" in st.session_state and len(st.session_state["pending_annotations"]) > 0:
+            with st.spinner("💾 正在將標記寫入硬碟中，請稍候..."):
+                dm = DatasetManager()
+                for frm, name, box in st.session_state["pending_annotations"]:
+                    dm.save_annotation(frm, name, box)
+            st.session_state["pending_annotations"] = []
+            
+        st.success("✅ 問題軌跡審核告一段落，已存入 dataset 供日後訓練使用！")
 
 # ─────────────────────────────────────────────
 # Step 3: 結果展示
